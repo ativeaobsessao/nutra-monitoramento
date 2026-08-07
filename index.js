@@ -1929,9 +1929,15 @@ app.get("/funis", async (_req, res) => {
   const semMapa = [];
   for (const p of pages) {
     const nodes = nodesBySlug[p.slug] || [];
-    if (nodes.length === 0) { semMapa.push(p); continue; }
     const edges = edgesBySlug[p.slug] || [];
-    const caminhos = computarCaminhos(nodes, edges);
+    // Regra: só entra em "COM FUNIL" quem tem pelo menos 1 caminho CONECTADO
+    // (computarCaminhos() só retorna componentes com 2+ nós ligados). Nós
+    // soltos (ex: ADS cadastrado mas ainda não conectado a nada) não bastam
+    // para tirar a página de "SEM FUNIL MAPEADO AINDA" — eles continuam
+    // preservados e visíveis em /admin/funis/:slug e no /dashboard, só não
+    // aparecem aqui como "funil pronto" até serem conectados.
+    const caminhos = nodes.length > 0 ? computarCaminhos(nodes, edges) : [];
+    if (caminhos.length === 0) { semMapa.push(p); continue; }
     comMapa.push({ ...p, caminhos });
   }
 
