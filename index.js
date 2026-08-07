@@ -110,6 +110,31 @@ async function initDb() {
   await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_from ON funnel_edges(from_node_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_to ON funnel_edges(to_node_id)`);
 
+  // Migração: amplia o CHECK de funnel_nodes.tipo para incluir 'ads' e 'presell'.
+  // O bloco DO $$ procura dinamicamente qual é o nome do CHECK constraint da
+  // coluna `tipo` (o Postgres gera automaticamente, não precisamos adivinhar)
+  // e o remove antes de recriar com a lista ampliada. Seguro rodar em todo
+  // restart: se não achar constraint nenhum, não faz nada; se achar, recria.
+  await query(`
+    DO $$
+    DECLARE
+      c_name text;
+    BEGIN
+      SELECT conname INTO c_name
+      FROM pg_constraint
+      WHERE conrelid = 'funnel_nodes'::regclass
+        AND contype = 'c'
+        AND pg_get_constraintdef(oid) ILIKE '%tipo%';
+      IF c_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE funnel_nodes DROP CONSTRAINT %I', c_name);
+      END IF;
+    END $$;
+  `);
+  await query(`
+    ALTER TABLE funnel_nodes ADD CONSTRAINT funnel_nodes_tipo_check
+    CHECK (tipo IN ('ads','advertorial','presell','tsl','vsl','quiz','whatsapp','checkout'))
+  `);
+
   console.log("[DB] Tables ready.");
 }
 
@@ -1059,14 +1084,16 @@ app.get("/api/lote/status", (_req, res) => {
 // ─── Funis (modelo de grafo: nós + conexões) ────────────────────────────────
 
 const TIPO_INFO = {
+  ads:         { icon: "📢", label: "ADS" },
   advertorial: { icon: "📄", label: "Advertorial" },
+  presell:     { icon: "🧲", label: "Presell" },
   tsl:         { icon: "📝", label: "TSL" },
   vsl:         { icon: "🎬", label: "VSL" },
   quiz:        { icon: "🧩", label: "Quiz" },
   whatsapp:    { icon: "💬", label: "WhatsApp" },
   checkout:    { icon: "💳", label: "Checkout" },
 };
-const TIPOS_ORDEM = ["advertorial", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
+const TIPOS_ORDEM = ["ads", "advertorial", "presell", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
 
 // Computa todos os caminhos (raiz → folha) de um grafo de nós/conexões.
 // Raiz = nó sem conexão de entrada. Folha = nó sem conexão de saída.
