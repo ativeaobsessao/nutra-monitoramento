@@ -2131,6 +2131,37 @@ app.get("/dashboard", async (_req, res) => {
     const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
 
+    // ── Mapeamento ADS ──────────────────────────────────────────────────────
+    // Lê TODO nó tipo='ads', conectado ou não a um funil — diferente de
+    // computarCaminhos() (usado em /funis), que só mostra nós já conectados
+    // em componente com 2+ elementos. Aqui o objetivo é nunca "perder de
+    // vista" um anúncio mapeado, mesmo que a VSL/checkout ainda não tenham
+    // sido conectados a ele.
+    const { rows: adsRows } = await query(`
+      SELECT fn.id, fn.rotulo, fn.url AS ad_url, p.slug, p.nome, p.tipo
+      FROM funnel_nodes fn
+      JOIN pages p ON p.slug = fn.slug
+      WHERE fn.tipo = 'ads'
+      ORDER BY p.nome, fn.created_at ASC
+    `);
+    const adsBySlug = {};
+    adsRows.forEach(r => {
+      (adsBySlug[r.slug] ||= { nome: r.nome, tipo: r.tipo, itens: [] })
+        .itens.push({ id: r.id, rotulo: r.rotulo, url: r.ad_url });
+    });
+    const adsPaginas = Object.values(adsBySlug).sort((a, b) => a.nome.localeCompare(b.nome));
+    const adsCardsHtml = adsPaginas.map(pg => `
+      <div class="ads-card">
+        <div class="ads-card-hdr">
+          <span class="ads-card-badge">${pg.tipo === "dominio" ? "🌐" : "📡"}</span>
+          <span class="ads-card-nome">${pg.nome}</span>
+          <span class="ads-count-badge">📢 ${pg.itens.length} ADS</span>
+        </div>
+        <div class="ads-chip-row">
+          ${pg.itens.map(a => `<a href="${a.url}" target="_blank" rel="noopener" class="ads-chip" title="${a.rotulo}">📢 ${a.rotulo}</a>`).join("")}
+        </div>
+      </div>`).join("");
+
     const dados       = JSON.stringify(grupoPaginas.geral);
     const histDados   = JSON.stringify(grupoPaginas.hist);
     const dadosDom    = JSON.stringify(grupoDominios.geral);
@@ -2252,6 +2283,15 @@ tbody tr:hover td{background:var(--surface2)}
   .scalebar-bg{width:50px}
 }
 @media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
+.ads-section{display:flex;flex-direction:column;gap:12px;margin-bottom:6px}
+.ads-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+.ads-card-hdr{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.ads-card-badge{font-size:15px}
+.ads-card-nome{font-size:14px;font-weight:700;color:#fff}
+.ads-count-badge{margin-left:auto;font-size:11px;font-weight:600;color:#a78bfa;background:rgba(167,139,250,.12);padding:3px 10px;border-radius:7px;white-space:nowrap}
+.ads-chip-row{display:flex;flex-wrap:wrap;gap:8px}
+.ads-chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff;transition:border-color .15s}
+.ads-chip:hover{border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -2341,6 +2381,13 @@ tbody tr:hover td{background:var(--surface2)}
   <span>O mapeamento completo de funis agora tem uma página dedicada.</span>
   <a href="/funis" style="font-size:13px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:8px 18px;border-radius:8px;white-space:nowrap">🔀 Abrir Mapa de Funis</a>
 </div>
+
+<div style="height:36px"></div>
+
+<div class="group-title">📢 Mapeamento ADS</div>
+${adsPaginas.length === 0
+  ? '<div class="empty-hint">Nenhum ADS mapeado ainda. Cadastre em Admin → 🔀 Funis → Nova Etapa (tipo ADS) — não precisa conectar a nada.</div>'
+  : `<div class="ads-section">${adsCardsHtml}</div>`}
 
 <div style="height:36px"></div>
 
