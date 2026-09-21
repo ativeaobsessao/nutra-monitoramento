@@ -44,6 +44,17 @@ async function query(sql, params = []) {
   }
 }
 
+// Garante que toda URL salva tenha esquema (http/https). Sem isso, o Playwright falha
+// ao tentar navegar ("Cannot navigate to invalid URL") e, em links renderizados no
+// front-end (<a href="...">), o navegador interpreta como caminho relativo e abre
+// dentro do próprio domínio do app (ex: "Cannot GET /dominio.com").
+function normalizeUrl(url) {
+  if (!url) return url;
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
@@ -88,6 +99,16 @@ async function initDb() {
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
 
+  // FIX (fila travada / starvation do cron): coluna que registra a última tentativa
+  // de coleta de cada página, sucesso OU falha. Sem isso, uma página com falha
+  // persistente nunca sai da lista de "pendentes" do slot (porque falha não grava em
+  // scrape_history) e, sem ORDER BY, a query do /api/cron/tick devolvia sempre as
+  // mesmas 5 páginas quebradas em todo tick — monopolizando o LIMIT 5 e impedindo
+  // qualquer outra página do slot de ser tentada. Ver uso em processBatch() e na
+  // query de /api/cron/tick.
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_status TEXT`);
+
   await query(`
     CREATE TABLE IF NOT EXISTS funnel_nodes (
       id         SERIAL PRIMARY KEY,
@@ -111,10 +132,12 @@ async function initDb() {
   await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_to ON funnel_edges(to_node_id)`);
 
   // Migração: amplia o CHECK de funnel_nodes.tipo para incluir 'ads' e 'presell'.
-  // O bloco DO $$ procura dinamicamente qual é o nome do CHECK constraint da
-  // coluna `tipo` (o Postgres gera automaticamente, não precisamos adivinhar)
-  // e o remove antes de recriar com a lista ampliada. Seguro rodar em todo
-  // restart: se não achar constraint nenhum, não faz nada; se achar, recria.
+  // Em vez de depender de adivinhar o nome do constraint (que o Postgres gera
+  // automaticamente), o bloco DO $$ abaixo PROCURA dinamicamente qual é o CHECK
+  // constraint da coluna `tipo` e o remove, seja qual for o nome — depois recria
+  // com um nome fixo e conhecido (`funnel_nodes_tipo_check`). Isso é 100% seguro
+  // de rodar em todo restart: se não encontrar nenhum constraint, não faz nada;
+  // se encontrar, remove e recria com a lista ampliada.
   await query(`
     DO $$
     DECLARE
@@ -167,45 +190,168 @@ function getChromiumPath() {
 
 // ─── Scraper ─────────────────────────────────────────────────────────────────
 
+function getBrowserLaunchArgs() {
+  return [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--window-size=1366,768",
+  ];
+}
+
+async function createStealthContext(browser) {
+  const context = await browser.newContext({
+    locale: "pt-BR",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 768 },
+    extraHTTPHeaders: {
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+    },
+  });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["pt-BR", "pt", "en-US", "en"] });
+    window.chrome = { runtime: {} };
+  });
+
+  // Injeta cookies de sessão do Facebook se configurados
+  const fbCookiesRaw = process.env.FB_COOKIES;
+  if (fbCookiesRaw) {
+    try {
+      const raw = JSON.parse(fbCookiesRaw);
+      // Suporta formato Cookie-Editor (array de objetos) e formato Netscape simplificado
+      const cookies = raw.map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain || ".facebook.com",
+        path: c.path || "/",
+        httpOnly: c.httpOnly ?? false,
+        secure: c.secure ?? true,
+        sameSite: c.sameSite === "no_restriction" ? "None"
+                : c.sameSite === "lax" ? "Lax"
+                : c.sameSite === "strict" ? "Strict"
+                : "None",
+        ...(c.expirationDate ? { expires: Math.floor(c.expirationDate) } : {}),
+      }));
+      await context.addCookies(cookies);
+      console.log(`[AUTH] ${cookies.length} cookies do Facebook injetados no contexto.`);
+    } catch (err) {
+      console.warn(`[AUTH] Falha ao parsear FB_COOKIES: ${err.message} — continuando sem autenticação.`);
+    }
+  } else {
+    console.warn("[AUTH] FB_COOKIES não definido — Playwright rodará sem sessão (pode falhar na Meta).");
+  }
+
+  return context;
+}
+
+async function extractCount(page) {
+  return await page.evaluate(() => {
+    const bodyText = document.body ? document.body.innerText : "";
+    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
+    for (const el of elements) {
+      const txt = el.innerText || "";
+      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados|results)/i.test(txt)) {
+        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+        if (match) {
+          const n = parseInt(match[1].replace(/[,.]/g, ""), 10);
+          if (!Number.isNaN(n)) return n;
+        }
+      }
+    }
+
+    const docText = document.documentElement ? document.documentElement.innerText : "";
+    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    return null;
+  }).catch(() => null);
+}
+
+async function waitForCounter(page, maxWaitMs = 18000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const count = await extractCount(page);
+    if (count !== null) return count;
+    await page.evaluate(() => window.scrollBy(0, 100)).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+  return null;
+}
+
+function cleanMetaUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.hostname.includes("facebook.com") && u.searchParams.has("view_all_page_id") && u.searchParams.has("id")) {
+      u.searchParams.delete("id");
+      return u.toString();
+    }
+  } catch {}
+  return rawUrl;
+}
+
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
   try {
-    // PILAR 1: Interceptação de Rede (Network Blocking)
-    // Aborta o download de imagens, vídeos, css e fontes pesadas da Meta Ad Library para economizar 70% de RAM e CPU.
+    // Bloqueia APENAS imagens e mídias pesadas — NUNCA bloqueia CSS nem scripts
     await page.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (["image", "media", "font", "stylesheet"].includes(type)) {
+      if (["image", "media"].includes(type)) {
         route.abort();
       } else {
         route.continue();
       }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(15000);
-    const content = await page.content();
-    const htmlMatch = content.match(/([\d.,]+)\s*(resultados|results)/i);
-    if (htmlMatch) {
-      const parsed = parseInt(htmlMatch[1].replace(/[,.]/g, ""), 10);
-      if (!isNaN(parsed)) return parsed;
+    const targetUrl = cleanMetaUrl(url);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+
+    let n = await waitForCounter(page, 18000);
+    if (n !== null) return n;
+
+    // Se o contador não apareceu e a URL foi limpa, tenta a original também
+    if (targetUrl !== url) {
+      console.log(`[SCRAPE] tentando URL alternativa: ${url}`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+      n = await waitForCounter(page, 12000);
+      if (n !== null) return n;
     }
-    for (const kw of ["resultados", "results"]) {
-      try {
-        const el = page.locator(`text=/${kw}/i`).first();
-        await el.waitFor({ timeout: 3000 });
-        const texto = await el.innerText();
-        const match = texto.replace(/[,.]/g, "").match(/\d+/);
-        if (match) return parseInt(match[0], 10);
-      } catch {
-        continue;
-      }
+
+    // Se ainda não encontrou, checa se tem redirect para outra URL que NÃO SEJA _fb_noscript
+    const html = await page.content();
+    const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url\s*=\s*([^"'>]+)["']/i);
+    if (m && !m[1].includes("_fb_noscript")) {
+      const target = m[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+      const nextUrl = new URL(target, page.url()).toString();
+      console.log(`[SCRAPE] seguindo redirect válido: ${nextUrl}`);
+      await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      n = await waitForCounter(page, 12000);
+      if (n !== null) return n;
     }
-    const bodyText = (await page.textContent("body")) ?? "";
-    const textMatch = bodyText.match(/([\d.,]+)\s*(resultados|results)/i);
-    if (textMatch) {
-      const parsed = parseInt(textMatch[1].replace(/[,.]/g, ""), 10);
-      if (!isNaN(parsed)) return parsed;
-    }
+
+    // Log de diagnóstico
+    const pageTitle = await page.title().catch(() => "");
+    const bodySnippet = await page.evaluate(() => {
+      return (document.body ? document.body.innerText.slice(0, 300) : "").replace(/\s+/g, " ").trim();
+    }).catch(() => "");
+    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${bodySnippet}"`);
+
     return null;
   } finally {
     await page.close();
@@ -217,14 +363,10 @@ async function scrapeAdCount(url, retries = 3) {
     const browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
     try {
-      const context = await browser.newContext({
-        locale: "pt-BR",
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-      });
+      const context = await createStealthContext(browser);
       const count = await scrapeWithContext(context, url);
       if (count !== null) {
         console.log(`[SCRAPE] attempt=${attempt} count=${count}`);
@@ -236,10 +378,10 @@ async function scrapeAdCount(url, retries = 3) {
     } finally {
       await browser.close();
     }
-    if (attempt < retries) await new Promise((r) => setTimeout(r, 5000));
+    if (attempt < retries) await new Promise((r) => setTimeout(r, 4000));
   }
-  console.error(`[SCRAPE] all ${retries} attempts failed, returning 0`);
-  return 0;
+  console.error(`[SCRAPE] all ${retries} attempts failed, returning null`);
+  return null;
 }
 
 // Dedupe considera slot — só bloqueia duplicata do MESMO slot
@@ -275,6 +417,10 @@ async function saveCount(slug, count, slot) {
 async function captureInicial(slug, url) {
   try {
     const count = await scrapeAdCount(url, 2);
+    if (count === null) {
+      console.warn(`[DESCOBERTA] slug=${slug} falhou, nada gravado`);
+      return null;
+    }
     await query(
       `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
       [slug, count]
@@ -305,7 +451,8 @@ async function captureInicialWithContext(context, slug, url) {
       console.error(`[LOTE] slug=${slug} attempt=${attempt} error: ${err.message}`);
     }
   }
-  const final = count ?? 0;
+  if (count === null) return null;
+  const final = count;
   await query(`UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`, [slug, final]);
   await query(
     `INSERT INTO scrape_latest (slug, ads_count, collected_at) VALUES ($1, $2, NOW())
@@ -340,13 +487,9 @@ async function runLote(itens) {
     browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
-    const context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
+    const context = await createStealthContext(browser);
 
     for (const item of itens) {
       loteStatus.atual = item.nome;
@@ -400,81 +543,8 @@ async function mirrorToSheet(rows) {
   }
 }
 
-function getCurrentSlot() {
-  const now = new Date();
-  const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 6) return 22;
-  if (hour >= 6 && hour < 15) return 3;
-  return 12;
-}
-
-async function processBatch(pages, slot) {
-  let browser;
-  let context;
-  const results = [];
-
-  async function launchBrowser() {
-    if (browser) await browser.close();
-    browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-    });
-    context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
-  }
-
-  try {
-    await launchBrowser(); // Início limpo
-
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i];
-
-      let count = null;
-      for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-        try {
-          count = await scrapeWithContext(context, p.url);
-        } catch (err) {
-          console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
-        }
-      }
-      const final = count ?? 0;
-
-      if (slot !== null && slot !== undefined) {
-        await saveCount(p.slug, final, slot);
-      } else {
-        await query(
-          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-           VALUES ($1, $2, NOW())
-           ON CONFLICT (slug) DO UPDATE
-             SET ads_count    = EXCLUDED.ads_count,
-                 collected_at = EXCLUDED.collected_at`,
-          [p.slug, final]
-        );
-        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
-      }
-
-      results.push({ slug: p.slug, nome: p.nome, count: final });
-
-      // Delay tático entre páginas
-      await new Promise(r => setTimeout(r, 1500));
-    }
-  } catch (err) {
-    console.error(`[BATCH] fatal error: ${err.message}`);
-  } finally {
-    if (browser) await browser.close();
-  }
-
-  if (results.length > 0) {
-    await mirrorToSheet(results);
-  }
-  return results;
-}
-
 let isRunning = false;
+let blockedUntil = 0;
 
 let loteStatus = {
   emAndamento: false,
@@ -534,18 +604,129 @@ function parseLoteInput(texto) {
   return itens;
 }
 
+function getCurrentSlot() {
+  const now = new Date();
+  const hour = now.getUTCHours();
+  if (hour >= 1 && hour < 6) return 22;
+  if (hour >= 6 && hour < 15) return 3;
+  return 12;
+}
+
+async function processBatch(pages, slot) {
+  let browser;
+  let context;
+  const results = [];
+
+  async function launchBrowser() {
+    if (browser) await browser.close();
+    browser = await chromium.launch({
+      executablePath: getChromiumPath(),
+      headless: true,
+      args: getBrowserLaunchArgs(),
+    });
+    context = await createStealthContext(browser);
+  }
+
+  try {
+    await launchBrowser(); // Início limpo
+    
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+
+      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
+      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
+      let count = null;
+      let falhaMotivo = null;
+      if (!/^https?:\/\//i.test(p.url || "")) {
+        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
+        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
+      } else {
+        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
+          try {
+            count = await scrapeWithContext(context, p.url);
+          } catch (err) {
+            falhaMotivo = err.message;
+            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+          }
+        }
+      }
+
+      // FIX (fila travada / starvation do cron): registra a tentativa (sucesso OU
+      // falha) em pages.last_attempt_at. A query de /api/cron/tick agora ordena por
+      // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
+      // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
+      // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
+      await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = $2 WHERE slug = $1`, [p.slug, count === null ? "falha_scraping" : "ok"]);
+
+      // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
+      // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
+      // da janela de 8h.
+      if (count === null) {
+        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+
+      const final = count;
+
+      try {
+        if (slot !== null && slot !== undefined) {
+          await saveCount(p.slug, final, slot);
+        } else {
+          await query(
+            `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (slug) DO UPDATE
+               SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+            [p.slug, final]
+          );
+          console.log(`[LATEST] slug=${p.slug} count=${final} (manual)`);
+        }
+        results.push({ slug: p.slug, nome: p.nome, count: final });
+      } catch (dbErr) {
+        console.error(`[BATCH] slug=${p.slug} count=${final} COLETOU MAS FALHOU AO GRAVAR NO BANCO: ${dbErr.message}`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, dbError: true });
+      }
+
+      // Delay tático entre páginas
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (err) {
+    console.error(`[BATCH] fatal error: ${err.message}`);
+  } finally {
+    if (browser) await browser.close();
+  }
+
+  const resultsOk = results.filter((r) => r.count !== null);
+  if (resultsOk.length > 0) {
+    await mirrorToSheet(resultsOk);
+  }
+  return results;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.get("/api/cron/tick", async (req, res) => {
   res.json({ status: "alive", message: "Tick received" });
-
+  
   if (isRunning) return;
+  if (Date.now() < blockedUntil) return;
   isRunning = true;
-
+  
   try {
     const slot = getCurrentSlot();
+    // FIX (fila travada / starvation): ORDER BY p.last_attempt_at ASC NULLS FIRST
+    // garante rotação justa entre as páginas pendentes do slot. Sem isso, como a
+    // query não tinha ordenação explícita, o Postgres devolvia consistentemente as
+    // mesmas linhas (praticamente a ordem física da tabela) — então páginas que
+    // falham sempre (ex: bloqueio da Meta numa URL específica) nunca saíam do topo
+    // do resultado e ocupavam o LIMIT 5 inteiro em TODO tick, travando a coleta de
+    // qualquer outra página pendente daquele slot. Agora, toda página tentada
+    // (sucesso ou falha) vai pro fim da fila, e páginas nunca tentadas (NULL) vêm
+    // primeiro.
     const { rows: pages } = await query(`
       SELECT p.slug, p.nome, p.url
       FROM pages p
@@ -555,6 +736,7 @@ app.get("/api/cron/tick", async (req, res) => {
           AND sh.slot = $1 
           AND sh.collected_at >= NOW() - INTERVAL '8 hours'
       )
+      ORDER BY p.last_attempt_at ASC NULLS FIRST
       LIMIT 5;
     `, [slot]);
 
@@ -564,7 +746,13 @@ app.get("/api/cron/tick", async (req, res) => {
     }
 
     console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
-    await processBatch(pages, slot);
+    const results = await processBatch(pages, slot);
+    const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
+    const metaRes = results.filter(r => metaSlugs.has(r.slug));
+    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError)) {
+      blockedUntil = Date.now() + 90 * 60 * 1000;
+      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+    }
     console.log(`[TICK] Lote do slot ${slot} finalizado.`);
   } catch (err) {
     console.error("[TICK] Erro geral:", err);
@@ -574,8 +762,9 @@ app.get("/api/cron/tick", async (req, res) => {
 });
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
-  if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
+  const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
+  if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
+  const url = normalizeUrl(urlRaw);
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
@@ -627,6 +816,7 @@ app.get("/api/coletar/:slug", async (req, res) => {
   if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
   try {
     const count = await scrapeAdCount(row.url);
+    if (count === null) return res.status(502).type("text/plain").send("FALHA");
     res.type("text/plain").send(String(count));
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
@@ -639,18 +829,16 @@ app.get("/api/coletar/:slug", async (req, res) => {
     console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
-    res.type("text/plain").send("0");
+    res.status(500).type("text/plain").send("FALHA");
   }
 });
 
 app.get("/api/coletar-tudo", async (_req, res) => {
-  res.json({ status: "started" });
-
   if (isRunning) {
-    console.warn("[RUN] coleta-tudo abortada — já existe uma coleta em andamento (cron ou outro lote)");
-    return;
+    return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
   isRunning = true;
+  res.json({ status: "started" });
 
   (async () => {
     try {
@@ -787,7 +975,7 @@ app.get("/admin", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Nutra Monitor — Admin</title>
+<title>Lowticket Monitor — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -840,7 +1028,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 </head>
 <body>
 <div class="hdr">
-  <h1>⚙️ Admin — Nutra Monitor</h1>
+  <h1>⚙️ Admin — Lowticket Monitor</h1>
   <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
     <a href="/dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">← Ver Dashboard</a>
     <a href="/funis" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">🔀 Ver Mapa de Funis</a>
@@ -1835,10 +2023,12 @@ app.post("/admin/funis/remover-caminho", async (req, res) => {
 });
 
 app.post("/api/funis/salvar-node", async (req, res) => {
-  const { slug, tipo, rotulo, url, checkout_url } = req.body;
-  if (!slug || !tipo || !rotulo || !url) {
+  const { slug, tipo, rotulo, url: urlRaw, checkout_url: checkoutRaw } = req.body;
+  if (!slug || !tipo || !rotulo || !urlRaw) {
     return res.status(400).json({ error: "Missing required fields" });
   }
+  const url = normalizeUrl(urlRaw);
+  const checkout_url = checkoutRaw ? normalizeUrl(checkoutRaw) : checkoutRaw;
 
   try {
     // 1. Resolve ou cria o nó da Landing Page
@@ -1929,15 +2119,9 @@ app.get("/funis", async (_req, res) => {
   const semMapa = [];
   for (const p of pages) {
     const nodes = nodesBySlug[p.slug] || [];
+    if (nodes.length === 0) { semMapa.push(p); continue; }
     const edges = edgesBySlug[p.slug] || [];
-    // Regra: só entra em "COM FUNIL" quem tem pelo menos 1 caminho CONECTADO
-    // (computarCaminhos() só retorna componentes com 2+ nós ligados). Nós
-    // soltos (ex: ADS cadastrado mas ainda não conectado a nada) não bastam
-    // para tirar a página de "SEM FUNIL MAPEADO AINDA" — eles continuam
-    // preservados e visíveis em /admin/funis/:slug e no /dashboard, só não
-    // aparecem aqui como "funil pronto" até serem conectados.
-    const caminhos = nodes.length > 0 ? computarCaminhos(nodes, edges) : [];
-    if (caminhos.length === 0) { semMapa.push(p); continue; }
+    const caminhos = computarCaminhos(nodes, edges);
     comMapa.push({ ...p, caminhos });
   }
 
@@ -1965,7 +2149,7 @@ app.get("/funis", async (_req, res) => {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mapa de Funis — Nutra Monitor</title>
+<title>Mapa de Funis — Lowticket Monitor</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2036,7 +2220,7 @@ const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://ww
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -2073,6 +2257,8 @@ app.get("/dashboard", async (_req, res) => {
           ultimaColeta: latestRow
             ? new Date(latestRow.collected_at).toISOString()
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
+          tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
+          status:       p.last_status || null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
@@ -2137,12 +2323,14 @@ app.get("/dashboard", async (_req, res) => {
     const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
 
-    // ── Mapeamento ADS ──────────────────────────────────────────────────────
-    // Lê TODO nó tipo='ads', conectado ou não a um funil — diferente de
-    // computarCaminhos() (usado em /funis), que só mostra nós já conectados
-    // em componente com 2+ elementos. Aqui o objetivo é nunca "perder de
-    // vista" um anúncio mapeado, mesmo que a VSL/checkout ainda não tenham
-    // sido conectados a ele.
+    const dados       = JSON.stringify(grupoPaginas.geral);
+    const histDados   = JSON.stringify(grupoPaginas.hist);
+    const dadosDom    = JSON.stringify(grupoDominios.geral);
+    const histDadosDom = JSON.stringify(grupoDominios.hist);
+
+    // "📢 Mapeamento ADS": lê todo nó tipo='ads', conectado ou não, agrupado por página.
+    // Não depende de computarCaminhos() (que exige componente com 2+ nós) — um ADS
+    // cadastrado sozinho, sem conexão nenhuma, já aparece aqui.
     const { rows: adsRows } = await query(`
       SELECT fn.id, fn.rotulo, fn.url AS ad_url, p.slug, p.nome, p.tipo
       FROM funnel_nodes fn
@@ -2150,28 +2338,26 @@ app.get("/dashboard", async (_req, res) => {
       WHERE fn.tipo = 'ads'
       ORDER BY p.nome, fn.created_at ASC
     `);
+
     const adsBySlug = {};
     adsRows.forEach(r => {
       (adsBySlug[r.slug] ||= { nome: r.nome, tipo: r.tipo, itens: [] })
         .itens.push({ id: r.id, rotulo: r.rotulo, url: r.ad_url });
     });
     const adsPaginas = Object.values(adsBySlug).sort((a, b) => a.nome.localeCompare(b.nome));
+
     const adsCardsHtml = adsPaginas.map(pg => `
-      <div class="ads-card">
-        <div class="ads-card-hdr">
-          <span class="ads-card-badge">${pg.tipo === "dominio" ? "🌐" : "📡"}</span>
-          <span class="ads-card-nome">${pg.nome}</span>
+      <div class="player-card">
+        <div class="player-hdr">
+          <span class="player-tipo-badge ${pg.tipo === "dominio" ? "b-dom" : "b-pag"}">${pg.tipo === "dominio" ? "🌐" : "📡"}</span>
+          <span class="player-nome">${pg.nome}</span>
           <span class="ads-count-badge">📢 ${pg.itens.length} ADS</span>
         </div>
         <div class="ads-chip-row">
-          ${pg.itens.map(a => `<a href="${a.url}" target="_blank" rel="noopener" class="ads-chip" title="${a.rotulo}">📢 ${a.rotulo}</a>`).join("")}
+          ${pg.itens.map(a => `<a href="${a.url}" target="_blank" rel="noopener" class="chip" title="${a.rotulo}"><span class="chip-icon">📢</span><span class="chip-label">${a.rotulo}</span></a>`).join("")}
         </div>
-      </div>`).join("");
-
-    const dados       = JSON.stringify(grupoPaginas.geral);
-    const histDados   = JSON.stringify(grupoPaginas.hist);
-    const dadosDom    = JSON.stringify(grupoDominios.geral);
-    const histDadosDom = JSON.stringify(grupoDominios.hist);
+      </div>
+    `).join("");
 
     // Serializa o SVG do Instagram para uso seguro dentro do template literal JS
     const IG_SVG_ESC = IG_SVG.replace(/`/g, "\\`").replace(/\$/g, "\\$");
@@ -2181,7 +2367,7 @@ app.get("/dashboard", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Nutra Monitor</title>
+<title>Lowticket Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
@@ -2266,6 +2452,18 @@ tbody tr:hover td{background:var(--surface2)}
 .hist-slot.empty{color:var(--border)}
 .tbl-scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.player-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+.player-hdr{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.player-tipo-badge{font-size:15px;padding:2px 6px;border-radius:6px}
+.player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
+.b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-pag{background:rgba(52,211,153,.12);color:#34d399}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
+.chip:hover{border-color:var(--accent)}
+.chip-icon{font-size:13px}
+.chip-label{white-space:nowrap}
+.ads-count-badge{margin-left:auto;font-size:11px;font-weight:600;color:#a78bfa;background:rgba(167,139,250,.12);padding:3px 10px;border-radius:7px;white-space:nowrap}
+.ads-chip-row{display:flex;flex-wrap:wrap;gap:8px}
 @media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
 @media(max-width:768px){
   body{padding:12px}
@@ -2289,22 +2487,13 @@ tbody tr:hover td{background:var(--surface2)}
   .scalebar-bg{width:50px}
 }
 @media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
-.ads-section{display:flex;flex-direction:column;gap:12px;margin-bottom:6px}
-.ads-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
-.ads-card-hdr{display:flex;align-items:center;gap:10px;margin-bottom:12px}
-.ads-card-badge{font-size:15px}
-.ads-card-nome{font-size:14px;font-weight:700;color:#fff}
-.ads-count-badge{margin-left:auto;font-size:11px;font-weight:600;color:#a78bfa;background:rgba(167,139,250,.12);padding:3px 10px;border-radius:7px;white-space:nowrap}
-.ads-chip-row{display:flex;flex-wrap:wrap;gap:8px}
-.ads-chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff;transition:border-color .15s}
-.ads-chip:hover{border-color:var(--accent)}
 </style>
 </head>
 <body>
 
 <div class="hdr">
   <div>
-    <h1>📊 Nutra Monitor</h1>
+    <h1>📊 Lowticket Monitor</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
@@ -2393,11 +2582,12 @@ tbody tr:hover td{background:var(--surface2)}
 <div class="group-title">📢 Mapeamento ADS</div>
 ${adsPaginas.length === 0
   ? '<div class="empty-hint">Nenhum ADS mapeado ainda. Cadastre em Admin → 🔀 Funis → Nova Etapa (tipo ADS) — não precisa conectar a nada.</div>'
-  : `<div class="ads-section">${adsCardsHtml}</div>`}
+  : `<div class="player-caminhos" style="margin-bottom:26px">${adsCardsHtml}</div>`}
 
 <div style="height:36px"></div>
 
 <div class="group-title">📅 Histórico de Coletas</div>
+
 
 <div class="accordion-wrap">
   <button class="accordion-btn" onclick="toggleAccordion('pag_hist-section','pag_acc-icon')">
@@ -2548,6 +2738,7 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
     +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
     +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
+    +(ultima[pag]?.status==='falha_scraping'&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · falhou</div>':'')
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
