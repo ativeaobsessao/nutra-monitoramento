@@ -16,7 +16,10 @@ if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL environment variable is required.");
 }
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 // O Neon (serverless) derruba conexões ociosas de tempos em tempos (autosuspend/reciclagem
 // do pooler). Sem este handler, um erro num cliente idle do pool vira uma exceção não
