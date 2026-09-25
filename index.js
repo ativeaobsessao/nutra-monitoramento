@@ -55,6 +55,40 @@ function normalizeUrl(url) {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
+// Valida se a URL é da Biblioteca de Anúncios da Meta (host facebook.com + caminho /ads/library).
+function isMetaLibraryUrl(url) {
+  try {
+    const u = new URL(url);
+    return /(^|\.)facebook\.com$/i.test(u.hostname) && u.pathname.startsWith("/ads/library");
+  } catch {
+    return false;
+  }
+}
+
+// Devolve uma URL válida da Biblioteca a partir do que foi enviado, ou null (rejeitar).
+// - Já é URL da Biblioteca: devolve como está (limpa aspas/espaços e garante https://).
+// - tipo "dominio" e veio só o domínio (ou URL do site): monta a busca por palavra-chave com country=ALL.
+// - Qualquer outro caso: null.
+function resolveMetaUrl(raw, tipo) {
+  if (!raw) return null;
+  const limpo = String(raw).trim().replace(/^["'\s]+|["'\s]+$/g, "");
+  if (!limpo) return null;
+  const comEsquema = normalizeUrl(limpo);
+  if (isMetaLibraryUrl(comEsquema)) return comEsquema;
+  if (tipo === "dominio") {
+    const dominio = limpo
+      .replace(/^https?:\/\//i, "")
+      .replace(/^www\./i, "")
+      .split(/[\/?#]/)[0]
+      .trim()
+      .toLowerCase();
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(dominio)) {
+      return `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=${encodeURIComponent(dominio)}&search_type=keyword_unordered`;
+    }
+  }
+  return null;
+}
+
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
@@ -108,6 +142,7 @@ async function initDb() {
   // query de /api/cron/tick.
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_status TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_error TEXT`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS funnel_nodes (
@@ -255,7 +290,7 @@ async function createStealthContext(browser) {
 async function extractCount(page) {
   return await page.evaluate(() => {
     const bodyText = document.body ? document.body.innerText : "";
-    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
       if (!Number.isNaN(n)) return n;
@@ -264,8 +299,8 @@ async function extractCount(page) {
     const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
     for (const el of elements) {
       const txt = el.innerText || "";
-      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados|results)/i.test(txt)) {
-        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados?|results?)/i.test(txt)) {
+        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
         if (match) {
           const n = parseInt(match[1].replace(/[,.]/g, ""), 10);
           if (!Number.isNaN(n)) return n;
@@ -274,7 +309,7 @@ async function extractCount(page) {
     }
 
     const docText = document.documentElement ? document.documentElement.innerText : "";
-    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
       if (!Number.isNaN(n)) return n;
@@ -306,7 +341,48 @@ function cleanMetaUrl(rawUrl) {
   return rawUrl;
 }
 
-async function scrapeWithContext(context, url) {
+// Preenche o objeto diag (quando recebido) com o status classificado da coleta.
+function setDiag(diag, status, detalhe) {
+  if (!diag) return;
+  diag.status = status;
+  diag.detalhe = detalhe ? String(detalhe).slice(0, 500) : null;
+}
+
+// Lê o estado atual da página: frase de vazio, título da Biblioteca, sinais de bloqueio e texto para diagnóstico.
+async function detectPageState(page) {
+  return await page.evaluate(() => {
+    const t = (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim();
+    return {
+      vazio: /Nenhum an[uú]ncio corresponde|No ads match/i.test(t),
+      biblioteca: /Biblioteca de An[uú]ncios|Ad Library/i.test(t),
+      bloqueio: /captcha|checkpoint|confirme que voc[eê] [ée] humano|confirm (that )?you.?re (a )?human|security check|verifica[cç][aã]o de seguran[cç]a/i.test(t) || /\/login|checkpoint/i.test(location.pathname),
+      texto: t.slice(0, 1500),
+    };
+  }).catch(() => null);
+}
+
+// Espera o contador OU a tela de vazio. O vazio só vale se a frase + título da Biblioteca
+// se mantiverem por 3s seguidos SEM nenhum contador aparecer (evita pegar estado transitório).
+async function waitForCounterOrEmpty(page, maxWaitMs = 18000) {
+  const start = Date.now();
+  let vazioDesde = null;
+  while (Date.now() - start < maxWaitMs) {
+    const count = await extractCount(page);
+    if (count !== null) return { count, vazio: false };
+    const st = await detectPageState(page);
+    if (st && st.vazio && st.biblioteca) {
+      if (vazioDesde === null) vazioDesde = Date.now();
+      else if (Date.now() - vazioDesde >= 3000) return { count: null, vazio: true };
+    } else {
+      vazioDesde = null;
+    }
+    await page.evaluate(() => window.scrollBy(0, 100)).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+  return { count: null, vazio: false };
+}
+
+async function scrapeWithContext(context, url, diag = null) {
   const page = await context.newPage();
   try {
     // Bloqueia APENAS imagens e mídias pesadas — NUNCA bloqueia CSS nem scripts
@@ -319,18 +395,35 @@ async function scrapeWithContext(context, url) {
       }
     });
 
-    const targetUrl = cleanMetaUrl(url);
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+    // Navegação com classificação: erro de rede/timeout vira falha_timeout e continua propagando o erro.
+    const irPara = async (alvo, timeout) => {
+      try {
+        await page.goto(alvo, { waitUntil: "domcontentloaded", timeout });
+      } catch (err) {
+        setDiag(diag, "falha_timeout", err.message);
+        throw err;
+      }
+    };
 
-    let n = await waitForCounter(page, 18000);
-    if (n !== null) return n;
+    // Resultado positivo: contador encontrado (ok) ou tela de vazio confirmada (ok_zero).
+    const concluir = (r) => {
+      if (r.count !== null) { setDiag(diag, "ok", null); return true; }
+      if (r.vazio) { setDiag(diag, "ok_zero", "Meta: Nenhum anúncio corresponde aos critérios de pesquisa"); return true; }
+      return false;
+    };
+
+    const targetUrl = cleanMetaUrl(url);
+    await irPara(targetUrl, 35000);
+
+    let r = await waitForCounterOrEmpty(page, 18000);
+    if (concluir(r)) return r.count ?? 0;
 
     // Se o contador não apareceu e a URL foi limpa, tenta a original também
     if (targetUrl !== url) {
       console.log(`[SCRAPE] tentando URL alternativa: ${url}`);
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
-      n = await waitForCounter(page, 12000);
-      if (n !== null) return n;
+      await irPara(url, 35000);
+      r = await waitForCounterOrEmpty(page, 12000);
+      if (concluir(r)) return r.count ?? 0;
     }
 
     // Se ainda não encontrou, checa se tem redirect para outra URL que NÃO SEJA _fb_noscript
@@ -340,17 +433,17 @@ async function scrapeWithContext(context, url) {
       const target = m[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
       const nextUrl = new URL(target, page.url()).toString();
       console.log(`[SCRAPE] seguindo redirect válido: ${nextUrl}`);
-      await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      n = await waitForCounter(page, 12000);
-      if (n !== null) return n;
+      await irPara(nextUrl, 30000);
+      r = await waitForCounterOrEmpty(page, 12000);
+      if (concluir(r)) return r.count ?? 0;
     }
 
-    // Log de diagnóstico
+    // Falha: classifica em bloqueio ou parse e registra 1500 caracteres do que o robô viu.
+    const estado = await detectPageState(page);
     const pageTitle = await page.title().catch(() => "");
-    const bodySnippet = await page.evaluate(() => {
-      return (document.body ? document.body.innerText.slice(0, 300) : "").replace(/\s+/g, " ").trim();
-    }).catch(() => "");
-    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${bodySnippet}"`);
+    const texto = estado ? estado.texto : "";
+    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${texto}"`);
+    setDiag(diag, estado && estado.bloqueio ? "falha_bloqueio" : "falha_parse", `Título: ${pageTitle} | ${texto}`);
 
     return null;
   } finally {
@@ -597,9 +690,14 @@ function parseLoteInput(texto) {
       continue; // linha sem "|" ou vazia — ignora
     }
 
-    if (!nome || !url) continue;
+        if (!nome || !url) continue;
     const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
-    itens.push({ nome, url, tipo, instagram_url });
+    const urlValida = resolveMetaUrl(url, tipo);
+    if (!urlValida) {
+      console.warn(`[LOTE] linha ignorada, URL inválida para "${nome}": ${url}`);
+      continue;
+    }
+    itens.push({ nome, url: urlValida, tipo, instagram_url });
   }
   return itens;
 }
@@ -637,13 +735,15 @@ async function processBatch(pages, slot) {
       // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
       let count = null;
       let falhaMotivo = null;
-      if (!/^https?:\/\//i.test(p.url || "")) {
-        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
+      let diag = { status: null, detalhe: null };
+            if (!isMetaLibraryUrl(p.url || "")) {
+        falhaMotivo = `URL inválida (não é da Biblioteca da Meta): "${p.url}"`;
+        diag = { status: "falha_url_invalida", detalhe: falhaMotivo };
         console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
       } else {
         for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
           try {
-            count = await scrapeWithContext(context, p.url);
+            count = await scrapeWithContext(context, p.url, diag);
           } catch (err) {
             falhaMotivo = err.message;
             console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
@@ -656,14 +756,22 @@ async function processBatch(pages, slot) {
       // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
       // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
       // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
-      await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = $2 WHERE slug = $1`, [p.slug, count === null ? "falha_scraping" : "ok"]);
+      // Status classificado: ok / ok_zero / falha_bloqueio / falha_timeout / falha_parse / falha_url_invalida
+      const statusFinal = count !== null
+        ? (diag.status === "ok_zero" ? "ok_zero" : "ok")
+        : (diag.status && diag.status.startsWith("falha_") ? diag.status : "falha_timeout");
+      const erroFinal = count !== null ? null : (String(diag.detalhe || falhaMotivo || "").slice(0, 500) || null);
+      await query(
+        `UPDATE pages SET last_attempt_at = NOW(), last_status = $2, last_error = $3 WHERE slug = $1`,
+        [p.slug, statusFinal, erroFinal]
+      );
 
       // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
       // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
       // da janela de 8h.
       if (count === null) {
-        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
+        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta [${statusFinal}] ${erroFinal || "sem detalhe"} — pulado, histórico preservado (sem gravar 0 falso)`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, status: statusFinal, falha: erroFinal || falhaMotivo || "falha desconhecida" });
         await new Promise(r => setTimeout(r, 1500));
         continue;
       }
@@ -749,9 +857,10 @@ app.get("/api/cron/tick", async (req, res) => {
     const results = await processBatch(pages, slot);
     const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
     const metaRes = results.filter(r => metaSlugs.has(r.slug));
-    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError)) {
+    const FALHAS_TECNICAS = ["falha_bloqueio", "falha_timeout", "falha_parse"];
+    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
       blockedUntil = Date.now() + 90 * 60 * 1000;
-      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam (${metaRes.map(r => r.status).join(", ")}) — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
     }
     console.log(`[TICK] Lote do slot ${slot} finalizado.`);
   } catch (err) {
@@ -764,10 +873,11 @@ app.get("/api/cron/tick", async (req, res) => {
 app.post("/api/salvar", async (req, res) => {
   const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
   if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
-  const url = normalizeUrl(urlRaw);
-  const slug = toSlug(nome);
+    const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const url = resolveMetaUrl(urlRaw, tipoFinal);
+  if (!url) return res.status(400).json({ error: "URL inválida: informe a URL da Meta Ad Library (facebook.com/ads/library) ou, para tipo dominio, apenas o domínio." });
   await query(
     `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -827,6 +937,10 @@ app.get("/api/coletar/:slug", async (req, res) => {
       [slug, count]
     );
     console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
+    
+    // FIX: coleta manual bem-sucedida também limpa o estado de falha em pages,
+    // senão o dashboard continua exibindo "tentou ... falhou" com o dado já atualizado.
+    await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok', last_error = NULL WHERE slug = $1`, [slug]);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
     res.status(500).type("text/plain").send("FALHA");
@@ -963,6 +1077,7 @@ app.get("/admin", async (_req, res) => {
     if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
     if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
     if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
+    if (q.erro === "url-invalida") return '<div class="msg err">⚠️ URL inválida. Use a URL da Meta Ad Library (facebook.com/ads/library) ou, para Domínio, apenas o domínio (ex: site.com).</div>';
     if (q.erro === "lote-vazio") return '<div class="msg err">⚠️ Nenhum item enviado no lote.</div>';
     if (q.erro === "lote-invalido") return '<div class="msg err">⚠️ Nenhuma linha válida encontrada no lote.</div>';
     if (q.erro === "lote-em-andamento") return '<div class="msg err">⚠️ Já existe um lote em andamento. Aguarde terminar.</div>';
@@ -975,7 +1090,7 @@ app.get("/admin", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lowticket Monitor — Admin</title>
+<title>NUTRA MONITOR — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1028,7 +1143,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 </head>
 <body>
 <div class="hdr">
-  <h1>⚙️ Admin — Lowticket Monitor</h1>
+  <h1>⚙️ Admin — NUTRA MONITOR</h1>
   <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
     <a href="/dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">← Ver Dashboard</a>
     <a href="/funis" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">🔀 Ver Mapa de Funis</a>
@@ -1055,7 +1170,7 @@ ${msgOk}
       </div>
       <div class="field">
         <label>URL da Meta Ad Library</label>
-        <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+        <input type="text" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
       </div>
     </div>
 
@@ -1197,9 +1312,11 @@ function cancelarEdicao(){
 });
 
 app.post("/admin/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
-  if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
+    const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
+  if (!nome || !urlRaw) return res.redirect("/admin?erro=campos-obrigatorios");
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const url = resolveMetaUrl(urlRaw, tipoFinal);
+  if (!url) return res.redirect("/admin?erro=url-invalida");
 
   // Modo edição: atualiza o registro existente pelo slug original — o slug NUNCA muda,
   // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
@@ -2149,7 +2266,7 @@ app.get("/funis", async (_req, res) => {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mapa de Funis — Lowticket Monitor</title>
+<title>Mapa de Funis — NUTRA MONITOR</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2220,7 +2337,7 @@ const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://ww
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status, last_error FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -2259,6 +2376,7 @@ app.get("/dashboard", async (_req, res) => {
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
           tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
           status:       p.last_status || null,
+          erro:         p.last_error || null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
@@ -2367,7 +2485,7 @@ app.get("/dashboard", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lowticket Monitor</title>
+<title>NUTRA MONITOR</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
@@ -2406,12 +2524,14 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .acc-icon.open{transform:rotate(180deg)}
 .accordion-body{display:none;padding:0 18px 16px;overflow-x:auto;-webkit-overflow-scrolling:touch}
 .accordion-body.open{display:block}
-.grid-charts{display:grid;grid-template-columns:380px 1fr;gap:14px;margin-bottom:26px}
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+.grid-charts{display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:26px}
+@media(min-width:1100px){.grid-charts{grid-template-columns:380px 1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;min-width:0}
 .panel-title{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.rosca-wrap{display:flex;gap:16px;align-items:center}
-.rosca-canvas{width:150px;height:150px;position:relative;flex-shrink:0}
-.legend{display:flex;flex-direction:column;gap:7px;flex:1;min-width:0}
+.rosca-wrap{display:flex;flex-direction:column;gap:16px;align-items:center;min-width:0}
+@media(min-width:900px){.rosca-wrap{flex-direction:row}}
+.rosca-canvas{width:clamp(120px,40vw,150px);height:clamp(120px,40vw,150px);position:relative;flex-shrink:0}
+.legend{display:flex;flex-direction:column;gap:7px;flex:1;min-width:0;max-height:260px;overflow-y:auto}
 .leg-item{display:flex;align-items:center;gap:9px}
 .leg-dot{width:10px;height:10px;border-radius:3px;flex-shrink:0}
 .leg-name{font-size:12px;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2472,7 +2592,6 @@ tbody tr:hover td{background:var(--surface2)}
   .hdr-admin-btn{width:100%;justify-content:center;box-sizing:border-box}
   .hdr h1{font-size:15px}
   .hdr-sub{font-size:10px}
-  .scaling-strip{grid-template-columns:1fr 1fr}
   .scale-card-val{font-size:24px}
   .grid-charts{grid-template-columns:1fr}
   .rosca-wrap{flex-direction:column;align-items:flex-start}
@@ -2493,7 +2612,7 @@ tbody tr:hover td{background:var(--surface2)}
 
 <div class="hdr">
   <div>
-    <h1>📊 Lowticket Monitor</h1>
+    <h1>📊 NUTRA MONITOR</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
@@ -2738,7 +2857,7 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
     +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
     +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
-    +(ultima[pag]?.status==='falha_scraping'&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · falhou</div>':'')
+    +(ultima[pag]?.status&&ultima[pag].status.indexOf('falha_')===0&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px" title="'+String(ultima[pag].erro||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').slice(0,300)+'">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · '+({falha_timeout:'timeout/rede',falha_bloqueio:'bloqueio da Meta',falha_parse:'contador não lido',falha_url_invalida:'URL inválida',falha_scraping:'falhou'}[ultima[pag].status]||'falhou')+'</div>':'')
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
