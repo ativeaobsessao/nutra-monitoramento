@@ -2,12 +2,26 @@ import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 import { execSync } from "child_process";
+import { createHash, randomUUID } from "node:crypto";
 import pg from "pg";
+import {
+  getBusinessSlot,
+  getBusinessSlotForDomain,
+  getBusinessSlotForKeyword,
+  processWithRetries,
+  withTimeout,
+} from "./scrape-orchestration.js";
+import {
+  buildKeywordSearchUrl,
+  normalizeKeywordIdentity,
+  normalizeMonitoringType,
+  parseBatchLine,
+} from "./monitoring-input.js";
 
 const { Pool } = pg;
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Database ────────────────────────────────────────────────────────────────
@@ -18,7 +32,9 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10_000,
+  query_timeout: 15_000,
+  statement_timeout: 15_000,
 });
 
 // O Neon (serverless) derruba conexões ociosas de tempos em tempos (autosuspend/reciclagem
@@ -78,6 +94,7 @@ function resolveMetaUrl(raw, tipo) {
   if (!limpo) return null;
   const comEsquema = normalizeUrl(limpo);
   if (isMetaLibraryUrl(comEsquema)) return comEsquema;
+  if (tipo === "keyword") return buildKeywordSearchUrl(limpo);
   if (tipo === "dominio") {
     const dominio = limpo
       .replace(/^https?:\/\//i, "")
@@ -99,6 +116,7 @@ async function initDb() {
       nome          TEXT NOT NULL,
       url           TEXT NOT NULL,
       tipo          TEXT NOT NULL DEFAULT 'pagina',
+      keyword_key   TEXT,
       instagram_url TEXT,
       geo           TEXT,
       nicho         TEXT,
@@ -119,6 +137,10 @@ async function initDb() {
   await query(`
     CREATE INDEX IF NOT EXISTS idx_scrape_history_slug ON scrape_history(slug)
   `);
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_scrape_history_collected_at
+    ON scrape_history(collected_at DESC)
+  `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS scrape_latest (
@@ -128,13 +150,121 @@ async function initDb() {
     )
   `);
 
+  await query(`ALTER TABLE scrape_history ADD COLUMN IF NOT EXISTS business_date DATE`);
+  await query(`
+    UPDATE scrape_history
+    SET business_date = (
+      (collected_at - INTERVAL '3 hours')
+      - CASE
+          WHEN EXTRACT(HOUR FROM collected_at - INTERVAL '3 hours') < 3
+          THEN INTERVAL '1 day'
+          ELSE INTERVAL '0 days'
+        END
+    )::date
+    WHERE slot IS NOT NULL AND business_date IS NULL
+  `);
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_scrape_history_slot_business_date
+    ON scrape_history(slug, slot, business_date)
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS scrape_attempts (
+      id           TEXT PRIMARY KEY,
+      slug         TEXT NOT NULL,
+      source       TEXT NOT NULL,
+      slot         SMALLINT,
+      business_date DATE,
+      status       TEXT NOT NULL,
+      ads_count    INTEGER,
+      error        TEXT,
+      started_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP,
+      lease_owner  TEXT NOT NULL
+    )
+  `);
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_scrape_attempts_slug_started
+    ON scrape_attempts(slug, started_at DESC)
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS scrape_worker_lease (
+      lease_key    TEXT PRIMARY KEY,
+      owner_id     TEXT,
+      expires_at   TIMESTAMP NOT NULL,
+      blocked_until TIMESTAMP
+    )
+  `);
+  await query(`
+    INSERT INTO scrape_worker_lease (lease_key, expires_at)
+    VALUES ('scraper', NOW() - INTERVAL '1 day')
+    ON CONFLICT (lease_key) DO NOTHING
+  `);
+
   // Migrações: garante colunas novas em banco antigo (seguro rodar sempre)
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS keyword_key TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS instagram_url TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
+  await query(`
+    DO $$
+    DECLARE
+      c_name text;
+    BEGIN
+      FOR c_name IN
+        SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_attribute a
+          ON a.attrelid = c.conrelid
+         AND a.attname = 'tipo'
+        WHERE c.conrelid = 'pages'::regclass
+          AND c.contype = 'c'
+          AND a.attnum = ANY(c.conkey)
+      LOOP
+        EXECUTE format('ALTER TABLE pages DROP CONSTRAINT %I', c_name);
+      END LOOP;
+    END $$;
+  `);
+  await query(`
+    ALTER TABLE pages ADD CONSTRAINT pages_tipo_check
+    CHECK (tipo IN ('pagina', 'dominio', 'keyword'))
+  `);
+  await query(`
+    WITH identities AS (
+      SELECT slug,
+             COALESCE(
+               NULLIF(keyword_key, ''),
+               lower(regexp_replace(btrim(nome), '[[:space:]]+', ' ', 'g'))
+             ) AS identity,
+             row_number() OVER (
+               PARTITION BY COALESCE(
+                 NULLIF(keyword_key, ''),
+                 lower(regexp_replace(btrim(nome), '[[:space:]]+', ' ', 'g'))
+               )
+               ORDER BY slug
+             ) AS identity_rank
+      FROM pages
+      WHERE tipo = 'keyword'
+    )
+    UPDATE pages p
+    SET keyword_key = CASE
+      WHEN identities.identity_rank = 1 THEN identities.identity
+      ELSE identities.identity || '::legacy::' || identities.slug
+    END
+    FROM identities
+    WHERE p.slug = identities.slug
+      AND p.keyword_key IS DISTINCT FROM CASE
+        WHEN identities.identity_rank = 1 THEN identities.identity
+        ELSE identities.identity || '::legacy::' || identities.slug
+      END
+  `);
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_keyword_key_unique
+    ON pages(keyword_key) WHERE tipo = 'keyword'
+  `);
 
   // FIX (fila travada / starvation do cron): coluna que registra a última tentativa
   // de coleta de cada página, sucesso OU falha. Sem isso, uma página com falha
@@ -196,7 +326,7 @@ async function initDb() {
     CHECK (tipo IN ('ads','advertorial','presell','tsl','vsl','quiz','whatsapp','checkout'))
   `);
 
-  console.log("[DB] Tables ready.");
+  console.log("[DB] Tabelas ready");
 }
 
 
@@ -211,6 +341,108 @@ function toSlug(nome) {
     .replace(/[^a-z0-9-]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+async function saveMonitoringRecord({
+  nome,
+  url,
+  tipo,
+  instagram_url = null,
+  geo = null,
+  nicho = null,
+  funil = null,
+}) {
+  const baseSlug = toSlug(nome);
+  if (!baseSlug) throw new Error("Could not generate a valid slug.");
+  const keywordKey = tipo === "keyword" ? normalizeKeywordIdentity(nome) : null;
+  if (tipo === "keyword" && !keywordKey) throw new Error("A palavra-chave não pode estar vazia.");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (keywordKey) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`keyword:${keywordKey}`]);
+    }
+
+    let existing;
+    if (keywordKey) {
+      const result = await client.query(
+        "SELECT slug FROM pages WHERE tipo = 'keyword' AND keyword_key = $1 FOR UPDATE",
+        [keywordKey],
+      );
+      existing = result.rows[0];
+    } else {
+      const result = await client.query(
+        "SELECT slug FROM pages WHERE slug = $1 AND tipo = $2 FOR UPDATE",
+        [baseSlug, tipo],
+      );
+      existing = result.rows[0];
+      if (!existing) {
+        const typedResult = await client.query(
+          "SELECT slug FROM pages WHERE slug = $1 AND tipo = $2 FOR UPDATE",
+          [`${tipo}-${baseSlug}`, tipo],
+        );
+        existing = typedResult.rows[0];
+      }
+    }
+
+    let slug = existing?.slug;
+    if (slug) {
+      await client.query(
+        `UPDATE pages
+         SET nome = $2, url = $3, instagram_url = COALESCE($4, instagram_url),
+             geo = COALESCE($5, geo), nicho = COALESCE($6, nicho),
+             funil = COALESCE($7, funil), keyword_key = $8
+         WHERE slug = $1`,
+        [slug, nome, url, instagram_url, geo, nicho, funil, keywordKey],
+      );
+    } else {
+      for (let suffix = 0; suffix < 1000; suffix++) {
+        const candidate = suffix === 0
+          ? baseSlug
+          : `${tipo}-${baseSlug}${suffix === 1 ? "" : `-${suffix}`}`;
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`slug:${candidate}`]);
+        const occupied = await client.query(
+          "SELECT slug, tipo, keyword_key FROM pages WHERE slug = $1 FOR UPDATE",
+          [candidate],
+        );
+        if (occupied.rowCount) {
+          const row = occupied.rows[0];
+          if (row.tipo === tipo && (tipo !== "keyword" || row.keyword_key === keywordKey)) {
+            slug = row.slug;
+            await client.query(
+              `UPDATE pages
+               SET nome = $2, url = $3, instagram_url = COALESCE($4, instagram_url),
+                   geo = COALESCE($5, geo), nicho = COALESCE($6, nicho),
+                   funil = COALESCE($7, funil), keyword_key = $8
+               WHERE slug = $1`,
+              [slug, nome, url, instagram_url, geo, nicho, funil, keywordKey],
+            );
+            break;
+          }
+          continue;
+        }
+        slug = candidate;
+        await client.query(
+          `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil, keyword_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [slug, nome, url, tipo, instagram_url, geo, nicho, funil, keywordKey],
+        );
+        break;
+      }
+      if (!slug) throw new Error("Could not allocate a unique monitoring identifier.");
+    }
+
+    await client.query("COMMIT");
+    return { slug, keyword_key: keywordKey };
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackError) => {
+      console.error(`[SALVAR] rollback falhou: ${rollbackError.message}`);
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 function getChromiumPath() {
@@ -292,7 +524,8 @@ async function createStealthContext(browser) {
 
 async function extractCount(page) {
   return await page.evaluate(() => {
-    const bodyText = document.body ? document.body.innerText : "";
+    const normalizeText = (text) => text.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ");
+    const bodyText = normalizeText(document.body ? document.body.innerText : "");
     let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
@@ -301,7 +534,7 @@ async function extractCount(page) {
 
     const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
     for (const el of elements) {
-      const txt = el.innerText || "";
+      const txt = normalizeText(el.innerText || "");
       if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados?|results?)/i.test(txt)) {
         const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
         if (match) {
@@ -311,7 +544,7 @@ async function extractCount(page) {
       }
     }
 
-    const docText = document.documentElement ? document.documentElement.innerText : "";
+    const docText = normalizeText(document.documentElement ? document.documentElement.innerText : "");
     m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
@@ -319,7 +552,7 @@ async function extractCount(page) {
     }
 
     return null;
-  }).catch(() => null);
+  });
 }
 
 async function waitForCounter(page, maxWaitMs = 18000) {
@@ -361,7 +594,7 @@ async function detectPageState(page) {
       bloqueio: /captcha|checkpoint|confirme que voc[eê] [ée] humano|confirm (that )?you.?re (a )?human|security check|verifica[cç][aã]o de seguran[cç]a/i.test(t) || /\/login|checkpoint/i.test(location.pathname),
       texto: t.slice(0, 1500),
     };
-  }).catch(() => null);
+  });
 }
 
 // Espera o contador OU a tela de vazio. O vazio só vale se a frase + título da Biblioteca
@@ -454,119 +687,50 @@ async function scrapeWithContext(context, url, diag = null) {
   }
 }
 
-async function scrapeAdCount(url, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    const browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: getBrowserLaunchArgs(),
-    });
-    try {
-      const context = await createStealthContext(browser);
-      const count = await scrapeWithContext(context, url);
-      if (count !== null) {
-        console.log(`[SCRAPE] attempt=${attempt} count=${count}`);
-        return count;
-      }
-      console.warn(`[SCRAPE] attempt=${attempt} — count not found, retrying...`);
-    } catch (err) {
-      console.error(`[SCRAPE] attempt=${attempt} error: ${err.message}`);
-    } finally {
-      await browser.close();
-    }
-    if (attempt < retries) await new Promise((r) => setTimeout(r, 4000));
-  }
-  console.error(`[SCRAPE] all ${retries} attempts failed, returning null`);
-  return null;
-}
-
-// Dedupe considera slot — só bloqueia duplicata do MESMO slot
-async function saveCount(slug, count, slot) {
-  console.log(`[SAVECOUNT] slug=${slug} slot=${slot}`);
-  const { rows: recent } = await query(
-    `SELECT id FROM scrape_history
-     WHERE slug = $1
-       AND slot IS NOT DISTINCT FROM $2
-       AND collected_at >= NOW() - INTERVAL '60 seconds'
-     LIMIT 1`,
-    [slug, slot]
-  );
-
-  await query(
-    `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (slug) DO UPDATE
-       SET ads_count    = EXCLUDED.ads_count,
-           collected_at = EXCLUDED.collected_at`,
-    [slug, count]
-  );
-
-  if (recent.length === 0) {
-    await query("INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, $3)", [slug, count, slot]);
-    console.log(`[HISTORY] slug=${slug} slot=${slot} count=${count} saved`);
-  } else {
-    console.log(`[HISTORY] slug=${slug} slot=${slot} skipped duplicate`);
-  }
-}
-
 // Captura inicial no momento do cadastro (individual)
 async function captureInicial(slug, url) {
+  let lease;
   try {
-    const count = await scrapeAdCount(url, 2);
-    if (count === null) {
-      console.warn(`[DESCOBERTA] slug=${slug} falhou, nada gravado`);
+    lease = await acquireScrapeLease("cadastro");
+    if (!lease) {
+      console.warn(`[DESCOBERTA] slug=${slug} captura inicial adiada: outra coleta está em andamento`);
       return null;
     }
-    await query(
-      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
-      [slug, count]
+    const [result] = await processBatch(
+      [{ slug, nome: slug, url }],
+      null,
+      null,
+      null,
+      { source: "cadastro", lease, persistInitial: true },
     );
-    await query(
-      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE
-         SET ads_count    = EXCLUDED.ads_count,
-             collected_at = EXCLUDED.collected_at`,
-      [slug, count]
-    );
-    console.log(`[DESCOBERTA] slug=${slug} inicial=${count} capturado no cadastro`);
-    return count;
+    if (result.count === null) console.warn(`[DESCOBERTA] slug=${slug} falhou, valor inicial não capturado`);
+    else console.log(`[DESCOBERTA] slug=${slug} inicial=${result.count} capturado no cadastro`);
+    return result.count;
   } catch (err) {
     console.error(`[DESCOBERTA] falha ao capturar inicial de slug=${slug}: ${err.message}`);
     return null;
+  } finally {
+    if (lease) await lease.release();
   }
-}
-
-// Versão de captureInicial que reutiliza browser já aberto (para lotes)
-async function captureInicialWithContext(context, slug, url) {
-  let count = null;
-  for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-    try {
-      count = await scrapeWithContext(context, url);
-    } catch (err) {
-      console.error(`[LOTE] slug=${slug} attempt=${attempt} error: ${err.message}`);
-    }
-  }
-  if (count === null) return null;
-  const final = count;
-  await query(`UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`, [slug, final]);
-  await query(
-    `INSERT INTO scrape_latest (slug, ads_count, collected_at) VALUES ($1, $2, NOW())
-     ON CONFLICT (slug) DO UPDATE SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
-    [slug, final]
-  );
-  return final;
 }
 
 // Processa lote em background (fire-and-forget)
 async function runLote(itens) {
-  if (isRunning) {
+  let lease;
+  try {
+    lease = await acquireScrapeLease("cadastro_lote");
+  } catch (err) {
+    console.error(`[LOTE] não foi possível reservar worker: ${err.message}`);
+    loteStatus.erros.push("Não foi possível reservar o worker de coleta.");
+    loteStatus.emAndamento = false;
+    return;
+  }
+  if (!lease) {
     console.warn("[LOTE] abortado — já existe uma coleta em andamento (cron ou outro lote)");
     loteStatus.erros.push("Abortado: já havia uma coleta (cron ou outro lote) em andamento. Tente de novo em alguns minutos.");
     loteStatus.emAndamento = false;
     return;
   }
-  isRunning = true;
   loteStatus = {
     emAndamento: true,
     total: itens.length,
@@ -578,45 +742,52 @@ async function runLote(itens) {
   };
   console.log(`[LOTE] ===== iniciado — ${itens.length} itens =====`);
 
-  let browser;
   try {
-    browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: getBrowserLaunchArgs(),
-    });
-    const context = await createStealthContext(browser);
-
+    const pages = [];
     for (const item of itens) {
-      loteStatus.atual = item.nome;
-      const slug = toSlug(item.nome);
-      if (!slug) {
+      if (!toSlug(item.nome)) {
         loteStatus.erros.push(`"${item.nome}" — nome inválido, ignorado`);
         loteStatus.concluidos++;
         continue;
       }
       try {
-        await query(
-          `INSERT INTO pages (slug, nome, url, tipo, instagram_url)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4,
-             instagram_url = COALESCE(EXCLUDED.instagram_url, pages.instagram_url)`,
-          [slug, item.nome, item.url, item.tipo, item.instagram_url || null]
-        );
-        await captureInicialWithContext(context, slug, item.url);
-        console.log(`[LOTE] slug=${slug} cadastrado e capturado (${loteStatus.concluidos + 1}/${itens.length})`);
+        const record = await saveMonitoringRecord({
+          nome: item.nome,
+          url: item.url,
+          tipo: item.tipo,
+          instagram_url: item.instagram_url || null,
+        });
+        pages.push({ slug: record.slug, nome: item.nome, url: item.url });
       } catch (err) {
-        console.error(`[LOTE] erro no item slug=${slug}: ${err.message}`);
+        console.error(`[LOTE] erro no item "${item.nome}": ${err.message}`);
         loteStatus.erros.push(`"${item.nome}" — erro: ${err.message}`);
+        loteStatus.concluidos++;
       }
-      loteStatus.concluidos++;
+    }
+    const reportedSlugs = new Set();
+    const results = await processBatch(
+      pages,
+      null,
+      (result) => {
+        if (!reportedSlugs.has(result.slug)) {
+          reportedSlugs.add(result.slug);
+          loteStatus.concluidos++;
+        }
+      },
+      (page) => { loteStatus.atual = page.nome; },
+      { source: "cadastro_lote", lease, persistInitial: true },
+    );
+    for (const result of results) {
+      if (result.count === null) {
+        loteStatus.erros.push(`"${result.nome}" — ${result.falha || "falha na captura inicial"}`);
+      }
+      console.log(`[LOTE] slug=${result.slug} cadastro e captura finalizados (${loteStatus.concluidos}/${itens.length})`);
     }
   } catch (err) {
     console.error(`[LOTE] erro fatal: ${err.message}`);
     loteStatus.erros.push(`Erro fatal: ${err.message}`);
   } finally {
-    if (browser) await browser.close();
-    isRunning = false;
+    await lease.release();
     loteStatus.emAndamento = false;
     loteStatus.atual = null;
     loteStatus.finalizadoEm = new Date().toISOString();
@@ -640,7 +811,17 @@ async function mirrorToSheet(rows) {
 }
 
 let isRunning = false;
-let blockedUntil = 0;
+const SCRAPE_LEASE_KEY = "scraper";
+const SCRAPE_LEASE_MS = 2 * 60 * 1000;
+const SCRAPE_HEARTBEAT_MS = 30 * 1000;
+const PAGE_TIMEOUT_MS = 120 * 1000;
+const PAGE_ATTEMPT_BUDGET_MS = 6 * 60 * 1000;
+const BATCH_TIMEOUT_MS = 45 * 60 * 1000;
+const BROWSER_START_TIMEOUT_MS = 30 * 1000;
+const BROWSER_CONNECT_TIMEOUT_MS = 15 * 1000;
+const PAGE_PAUSE_MS = 1500;
+const BROWSER_CLOSE_TIMEOUT_MS = 5000;
+let leaseHeartbeat = null;
 
 let loteStatus = {
   emAndamento: false,
@@ -652,6 +833,23 @@ let loteStatus = {
   finalizadoEm: null,
 };
 
+let manualCheckStatus = {
+  runId: null,
+  requestId: null,
+  status: "idle",
+  total: 0,
+  concluidos: 0,
+  sucesso: 0,
+  falha: 0,
+  atual: null,
+  resultados: [],
+  iniciadoEm: null,
+  finalizadoEm: null,
+  erro: null,
+};
+const manualCheckRequestLedger = new Map();
+const MANUAL_CHECK_REQUEST_LEDGER_LIMIT = 500;
+
 // Parser de lote — aceita 3 formatos:
 //   Nome | URL
 //   tipo | Nome | URL
@@ -661,328 +859,894 @@ function parseLoteInput(texto) {
   const linhas = texto.split("\n").map((l) => l.trim()).filter(Boolean);
   const itens = [];
   for (const linha of linhas) {
-    const partes = linha.split("|").map((s) => s.trim()).filter(Boolean);
-    let nome, url, tipoForcado = null, instagram_url = null;
-
-    if (partes.length >= 2) {
-      const possivelTipo = partes[0].toLowerCase();
-      if (possivelTipo === "dominio" || possivelTipo === "pagina") {
-        // tipo | Nome | URL [| Instagram]
-        tipoForcado = possivelTipo;
-        nome = partes[1];
-        // Verifica se o último campo é uma URL do Instagram
-        const ultimo = partes[partes.length - 1];
-        if (partes.length >= 4 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
-          instagram_url = ultimo;
-          url = partes.slice(2, partes.length - 1).join("|");
-        } else {
-          url = partes.slice(2).join("|");
-        }
-      } else {
-        // Nome | URL [| Instagram]
-        nome = partes[0];
-        const ultimo = partes[partes.length - 1];
-        if (partes.length >= 3 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
-          instagram_url = ultimo;
-          url = partes.slice(1, partes.length - 1).join("|");
-        } else {
-          url = partes.slice(1).join("|");
-        }
-      }
-    } else {
-      continue; // linha sem "|" ou vazia — ignora
-    }
-
-        if (!nome || !url) continue;
-    const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
-    const urlValida = resolveMetaUrl(url, tipo);
+    const item = parseBatchLine(linha);
+    if (!item?.nome || !item.url) continue;
+    const urlValida = resolveMetaUrl(item.url, item.tipo);
     if (!urlValida) {
-      console.warn(`[LOTE] linha ignorada, URL inválida para "${nome}": ${url}`);
+      console.warn(`[LOTE] linha ignorada, URL inválida para "${item.nome}": ${item.url}`);
       continue;
     }
-    itens.push({ nome, url: urlValida, tipo, instagram_url });
+    itens.push({ ...item, url: urlValida });
   }
   return itens;
 }
 
-function getCurrentSlot() {
-  const now = new Date();
-  const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 6) return 22;
-  if (hour >= 6 && hour < 15) return 3;
-  return 12;
+function getCurrentSlot(now = new Date()) {
+  return getBusinessSlot(now);
 }
 
-async function processBatch(pages, slot) {
+async function withScrapeLease(lease, callback) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT owner_id FROM scrape_worker_lease
+       WHERE lease_key = $1 AND expires_at > NOW()
+       FOR UPDATE`,
+      [SCRAPE_LEASE_KEY],
+    );
+    if (lease.lost || rows[0]?.owner_id !== lease.ownerId) {
+      throw new Error("A reserva do worker expirou ou foi assumida por outra execução.");
+    }
+    const result = await callback(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackError) => {
+      console.error(`[LEASE] rollback falhou: ${rollbackError.message}`);
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function acquireScrapeLease(source) {
+  if (isRunning) return null;
+  isRunning = true;
+  const ownerId = randomUUID();
+  try {
+    const { rows } = await query(
+      `INSERT INTO scrape_worker_lease (lease_key, owner_id, expires_at)
+       VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
+       ON CONFLICT (lease_key) DO UPDATE
+         SET owner_id = EXCLUDED.owner_id,
+             expires_at = EXCLUDED.expires_at
+         WHERE scrape_worker_lease.expires_at <= NOW()
+       RETURNING owner_id`,
+      [SCRAPE_LEASE_KEY, ownerId, SCRAPE_LEASE_MS],
+    );
+    if (rows.length === 0) {
+      isRunning = false;
+      console.warn(`[LEASE] ${source} não iniciou: worker reservado por outra instância`);
+      return null;
+    }
+
+    const lease = { ownerId, lost: false, release: null };
+    await withScrapeLease(lease, async (client) => {
+      const { rows: staleAttempts } = await client.query(
+        `UPDATE scrape_attempts
+         SET status = 'falha_execucao',
+             error = 'A execução anterior perdeu a reserva do worker.',
+             completed_at = NOW()
+         WHERE status = 'em_andamento' AND lease_owner <> $1
+         RETURNING slug, started_at`,
+        [ownerId],
+      );
+      for (const attempt of staleAttempts) {
+        await client.query(
+          `UPDATE pages SET last_status = 'falha_execucao', last_error = $2
+           WHERE slug = $1 AND last_attempt_at <= $3`,
+          [attempt.slug, "A execução anterior foi interrompida.", attempt.started_at],
+        );
+      }
+    });
+
+    leaseHeartbeat = setInterval(async () => {
+      try {
+        const { rowCount } = await query(
+          `UPDATE scrape_worker_lease
+           SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
+           WHERE lease_key = $1 AND owner_id = $2`,
+          [SCRAPE_LEASE_KEY, ownerId, SCRAPE_LEASE_MS],
+        );
+        if (rowCount !== 1) {
+          lease.lost = true;
+          console.error(`[LEASE] ${source} perdeu a reserva do worker`);
+        }
+      } catch (err) {
+        console.error(`[LEASE] heartbeat de ${source} falhou: ${err.message}`);
+      }
+    }, SCRAPE_HEARTBEAT_MS);
+    leaseHeartbeat.unref();
+
+    lease.release = async () => {
+      if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+      leaseHeartbeat = null;
+      try {
+        await query(
+          `UPDATE scrape_worker_lease
+           SET owner_id = NULL, expires_at = NOW() - INTERVAL '1 second'
+           WHERE lease_key = $1 AND owner_id = $2`,
+          [SCRAPE_LEASE_KEY, ownerId],
+        );
+      } catch (err) {
+        console.error(`[LEASE] não foi possível liberar reserva de ${source}: ${err.message}; ela expirará automaticamente`);
+      } finally {
+        isRunning = false;
+      }
+    };
+    console.log(`[LEASE] ${source} reservou o worker owner=${ownerId}`);
+    return lease;
+  } catch (err) {
+    try {
+      await query(
+        `UPDATE scrape_worker_lease
+         SET owner_id = NULL, expires_at = NOW() - INTERVAL '1 second'
+         WHERE lease_key = $1 AND owner_id = $2`,
+        [SCRAPE_LEASE_KEY, ownerId],
+      );
+    } catch (releaseError) {
+      console.error(`[LEASE] não foi possível liberar reserva após erro: ${releaseError.message}`);
+    }
+    isRunning = false;
+    throw err;
+  }
+}
+
+async function recordAttemptStart(page, source, slotInfo, lease) {
+  const attemptId = randomUUID();
+  await withScrapeLease(lease, async (client) => {
+    await client.query(
+      `INSERT INTO scrape_attempts
+         (id, slug, source, slot, business_date, status, lease_owner)
+       VALUES ($1, $2, $3, $4, $5, 'em_andamento', $6)`,
+      [attemptId, page.slug, source, slotInfo?.slot ?? null, slotInfo?.businessDate ?? null, lease.ownerId],
+    );
+    await client.query(
+      `UPDATE pages SET last_attempt_at = NOW(), last_status = 'em_andamento', last_error = NULL
+       WHERE slug = $1`,
+      [page.slug],
+    );
+  });
+  return attemptId;
+}
+
+async function saveSuccessfulCount(client, slug, count, slotInfo) {
+  await client.query(
+    `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (slug) DO UPDATE
+       SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+    [slug, count],
+  );
+
+  if (!slotInfo) {
+    console.log(`[LATEST] slug=${slug} count=${count} (manual; sem novo ponto no histórico automático)`);
+    return;
+  }
+
+  const { rows: existing } = await client.query(
+    `SELECT id FROM scrape_history
+     WHERE slug = $1 AND slot = $2 AND business_date = $3
+     LIMIT 1`,
+    [slug, slotInfo.slot, slotInfo.businessDate],
+  );
+  if (existing.length === 0) {
+    await client.query(
+      `INSERT INTO scrape_history (slug, ads_count, slot, business_date)
+       VALUES ($1, $2, $3, $4)`,
+      [slug, count, slotInfo.slot, slotInfo.businessDate],
+    );
+    console.log(`[HISTORY] slug=${slug} slot=${slotInfo.slot} date=${slotInfo.businessDate} count=${count} saved`);
+  } else {
+    console.log(`[HISTORY] slug=${slug} slot=${slotInfo.slot} date=${slotInfo.businessDate} skipped duplicate`);
+  }
+}
+
+async function completeAttempt(attemptId, page, result, options) {
+  const { lease, slotInfo, persistInitial } = options;
+  await withScrapeLease(lease, async (client) => {
+    if (result.count !== null && !result.dbError) {
+      await saveSuccessfulCount(client, page.slug, result.count, slotInfo);
+      if (persistInitial) {
+        await client.query(
+          `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+          [page.slug, result.count],
+        );
+      }
+    }
+    const { rowCount } = await client.query(
+      `UPDATE scrape_attempts
+       SET status = $2, ads_count = $3, error = $4, completed_at = NOW()
+       WHERE id = $1 AND status = 'em_andamento' AND lease_owner = $5`,
+      [attemptId, result.status, result.count, result.falha ?? null, lease.ownerId],
+    );
+    if (rowCount !== 1) throw new Error(`Não foi possível finalizar tentativa ${attemptId}.`);
+    await client.query(
+      `UPDATE pages SET last_attempt_at = NOW(), last_status = $2, last_error = $3 WHERE slug = $1`,
+      [page.slug, result.status, result.falha ?? null],
+    );
+  });
+}
+
+async function markAttemptWriteFailure(attemptId, page, error, lease) {
+  const message = "A coleta terminou, mas não foi possível persistir o resultado.";
+  try {
+    await withScrapeLease(lease, async (client) => {
+      await client.query(
+        `WITH failed AS (
+           UPDATE scrape_attempts
+           SET status = 'falha_gravacao', error = $2, completed_at = NOW()
+           WHERE id = $1 AND status = 'em_andamento' AND lease_owner = $3
+           RETURNING slug
+         )
+         UPDATE pages p SET last_attempt_at = NOW(), last_status = 'falha_gravacao', last_error = $4
+         FROM failed f WHERE p.slug = f.slug`,
+        [attemptId, `${message} ${error.message}`.slice(0, 500), lease.ownerId, message],
+      );
+    });
+  } catch (recordError) {
+    console.error(`[BATCH] slug=${page.slug} não foi possível persistir falha de gravação: ${recordError.message}`);
+  }
+}
+
+async function processBatch(pages, slotInfo, onResult = null, onPageStart = null, options = {}) {
+  const { source = slotInfo ? "cron" : "manual", lease, persistInitial = false } = options;
+  if (!lease) throw new Error("A coleta exige uma reserva durável do worker.");
+  const batchTimeoutMs = Math.ceil(pages.length / 5) * BATCH_TIMEOUT_MS;
+  const batchDeadline = Date.now() + batchTimeoutMs;
   let browser;
+  let browserServer;
   let context;
-  const results = [];
+  let pagesSinceLaunch = 0;
 
   async function launchBrowser() {
-    if (browser) await browser.close();
-    browser = await chromium.launch({
+    const server = await chromium.launchServer({
       executablePath: getChromiumPath(),
       headless: true,
+      timeout: BROWSER_START_TIMEOUT_MS,
       args: getBrowserLaunchArgs(),
     });
-    context = await createStealthContext(browser);
-  }
-
-  try {
-    await launchBrowser(); // Início limpo
-    
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i];
-
-      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
-      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
-      let count = null;
-      let falhaMotivo = null;
-      let diag = { status: null, detalhe: null };
-            if (!isMetaLibraryUrl(p.url || "")) {
-        falhaMotivo = `URL inválida (não é da Biblioteca da Meta): "${p.url}"`;
-        diag = { status: "falha_url_invalida", detalhe: falhaMotivo };
-        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
-      } else {
-        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-          try {
-            count = await scrapeWithContext(context, p.url, diag);
-          } catch (err) {
-            falhaMotivo = err.message;
-            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
-          }
-        }
-      }
-
-      // FIX (fila travada / starvation do cron): registra a tentativa (sucesso OU
-      // falha) em pages.last_attempt_at. A query de /api/cron/tick agora ordena por
-      // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
-      // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
-      // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
-      // Status classificado: ok / ok_zero / falha_bloqueio / falha_timeout / falha_parse / falha_url_invalida
-      const statusFinal = count !== null
-        ? (diag.status === "ok_zero" ? "ok_zero" : "ok")
-        : (diag.status && diag.status.startsWith("falha_") ? diag.status : "falha_timeout");
-      const erroFinal = count !== null ? null : (String(diag.detalhe || falhaMotivo || "").slice(0, 500) || null);
-      await query(
-        `UPDATE pages SET last_attempt_at = NOW(), last_status = $2, last_error = $3 WHERE slug = $1`,
-        [p.slug, statusFinal, erroFinal]
-      );
-
-      // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
-      // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
-      // da janela de 8h.
-      if (count === null) {
-        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta [${statusFinal}] ${erroFinal || "sem detalhe"} — pulado, histórico preservado (sem gravar 0 falso)`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, status: statusFinal, falha: erroFinal || falhaMotivo || "falha desconhecida" });
-        await new Promise(r => setTimeout(r, 1500));
-        continue;
-      }
-
-      const final = count;
-
-      try {
-        if (slot !== null && slot !== undefined) {
-          await saveCount(p.slug, final, slot);
-        } else {
-          await query(
-            `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT (slug) DO UPDATE
-               SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
-            [p.slug, final]
-          );
-          console.log(`[LATEST] slug=${p.slug} count=${final} (manual)`);
-        }
-        results.push({ slug: p.slug, nome: p.nome, count: final });
-      } catch (dbErr) {
-        console.error(`[BATCH] slug=${p.slug} count=${final} COLETOU MAS FALHOU AO GRAVAR NO BANCO: ${dbErr.message}`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, dbError: true });
-      }
-
-      // Delay tático entre páginas
-      await new Promise(r => setTimeout(r, 1500));
+    browserServer = server;
+    try {
+      browser = await chromium.connect(server.wsEndpoint(), { timeout: BROWSER_CONNECT_TIMEOUT_MS });
+      context = await createStealthContext(browser);
+    } catch (err) {
+      await closeBrowser("falha de inicialização");
+      throw err;
     }
-  } catch (err) {
-    console.error(`[BATCH] fatal error: ${err.message}`);
-  } finally {
-    if (browser) await browser.close();
   }
 
-  const resultsOk = results.filter((r) => r.count !== null);
+  async function closeBrowser(reason) {
+    const currentServer = browserServer;
+    browser = null;
+    browserServer = null;
+    context = null;
+    pagesSinceLaunch = 0;
+    if (!currentServer) return;
+    try {
+      await withTimeout(() => currentServer.close(), BROWSER_CLOSE_TIMEOUT_MS);
+    } catch (err) {
+      console.error(`[BATCH] fechamento do Chromium (${reason}) falhou: ${err.message}`);
+      const child = currentServer.process();
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          const exited = new Promise((resolve) => {
+            if (child.exitCode !== null || child.signalCode !== null) resolve();
+            else child.once("exit", resolve);
+          });
+          child.kill("SIGKILL");
+          await withTimeout(() => exited, BROWSER_CLOSE_TIMEOUT_MS);
+        } catch (killError) {
+          console.error(`[BATCH] encerramento forçado do Chromium (${reason}) falhou: ${killError.message}`);
+        }
+      }
+    }
+  }
+
+  async function attemptPage(page, pass) {
+    if (onPageStart) onPageStart(page);
+    const slotInfoForAttempt = slotInfo
+      ? { slot: slotInfo.slot, businessDate: slotInfo.businessDate }
+      : null;
+    const attemptId = await recordAttemptStart(page, source, slotInfoForAttempt, lease);
+    const diag = { status: null, detalhe: null };
+    let count = null;
+    let falha = null;
+
+    if (!isMetaLibraryUrl(page.url || "")) {
+      falha = `URL inválida (não é da Biblioteca da Meta): "${page.url}"`;
+      diag.status = "falha_url_invalida";
+      diag.detalhe = falha;
+      console.error(`[BATCH] slug=${page.slug} ${falha}`);
+    } else {
+      try {
+        count = await withTimeout(
+          async () => {
+            if (!browser || !browser.isConnected()) await launchBrowser();
+            return scrapeWithContext(context, page.url, diag);
+          },
+          PAGE_TIMEOUT_MS,
+          async () => {
+            console.error(`[BATCH] slug=${page.slug} pass=${pass} excedeu timeout de ${PAGE_TIMEOUT_MS}ms; fechando Chromium`);
+            await closeBrowser("timeout de página");
+          },
+        );
+        pagesSinceLaunch++;
+      } catch (err) {
+        falha = err.message;
+        if (err.name === "TimeoutError" || err.errors?.some((nested) => nested.name === "TimeoutError")) {
+          diag.status = "falha_timeout";
+          diag.detalhe = err.message;
+        } else if (!diag.status) {
+          diag.status = "falha_execucao";
+          diag.detalhe = err.message;
+        }
+        console.error(`[BATCH] slug=${page.slug} pass=${pass} erro: ${err.message}`);
+      }
+    }
+
+    const status = count !== null
+      ? diag.status === "ok_zero" ? "ok_zero" : "ok"
+      : diag.status?.startsWith("falha_") ? diag.status : "falha_timeout";
+    const result = {
+      slug: page.slug,
+      nome: page.nome,
+      count,
+      status,
+      falha: count === null ? (String(diag.detalhe || falha || "falha desconhecida").slice(0, 500)) : null,
+      retryable: status !== "falha_url_invalida",
+    };
+
+    try {
+      await completeAttempt(attemptId, page, result, { lease, slotInfo: slotInfoForAttempt, persistInitial });
+    } catch (dbErr) {
+      console.error(`[BATCH] slug=${page.slug} count=${count} falha ao gravar a tentativa: ${dbErr.message}`);
+      await markAttemptWriteFailure(attemptId, page, dbErr, lease);
+      result.count = null;
+      result.status = "falha_gravacao";
+      result.falha = "A coleta foi feita, mas não foi possível salvar o resultado.";
+      result.dbError = true;
+      result.retryable = true;
+    }
+
+    if (onResult) onResult(result);
+    if (pagesSinceLaunch >= 5) await closeBrowser("limite de cinco páginas");
+    await new Promise((resolve) => setTimeout(resolve, PAGE_PAUSE_MS));
+    return { ...result, ok: result.count !== null && !result.dbError };
+  }
+
+  let results;
+  try {
+    results = await processWithRetries(pages, attemptPage, {
+      maxPasses: 2,
+      isSuccess: (result) => result.ok,
+      shouldRetry: (result) => result.retryable,
+      shouldStartRetryPass: ({ pending, nextPass }) => {
+        const retryBudgetMs = pending.length * (PAGE_ATTEMPT_BUDGET_MS + PAGE_PAUSE_MS);
+        if (Date.now() + retryBudgetMs <= batchDeadline) return true;
+        console.warn(
+          `[BATCH] pass=${nextPass} não iniciada: orçamento restante insuficiente para ${pending.length} retentativas; ` +
+          "todas as bibliotecas já têm o resultado da primeira passagem registrado",
+        );
+        return false;
+      },
+    });
+    for (const result of results) {
+      if (!result.ok) {
+        console.warn(`[BATCH] slug=${result.slug} falhou após até duas passagens [${result.status}] ${result.falha || ""}`);
+      }
+    }
+  } finally {
+    await closeBrowser("fim do lote");
+  }
+
+  const resultsOk = results.filter((result) => result.count !== null && !result.dbError);
   if (resultsOk.length > 0) {
     await mirrorToSheet(resultsOk);
   }
-  return results;
+  return results.map(({ ok, retryable, ...result }) => result);
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
+app.get("/api/ultima-checagem", async (_req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT p.slug,
+             l.collected_at AS ultima_coleta_ok,
+             CASE
+               WHEN a.checked_at IS NULL THEN NULL
+               ELSE jsonb_build_object(
+                 'status', a.status,
+                 'error', a.error,
+                 'at', a.checked_at,
+                 'relevante', COALESCE(
+                   a.checked_at > NOW() - INTERVAL '6 hours'
+                   AND a.status IN ('falha_timeout','falha_bloqueio','falha_parse','falha_url_invalida','falha_gravacao'),
+                   FALSE
+                 )
+               )
+             END AS tentativa
+      FROM pages p
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(completed_at, started_at) AS checked_at, status, error, source
+        FROM scrape_attempts
+        WHERE slug = p.slug
+          AND source IN ('cron','cron_dominio','cron_keyword','manual_lote','manual_individual')
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      ) a ON TRUE
+      LEFT JOIN scrape_latest l ON l.slug = p.slug
+      ORDER BY p.slug
+    `);
+    res.set("Cache-Control", "no-store").json(rows);
+  } catch (err) {
+    console.error(`[API] falha ao consultar última checagem: ${err.message}`);
+    res.status(500).json({ error: "Não foi possível consultar a última checagem." });
+  }
+});
+
 app.get("/api/cron/tick", async (req, res) => {
   res.json({ status: "alive", message: "Tick received" });
-  
-  if (isRunning) return;
-  if (Date.now() < blockedUntil) return;
-  isRunning = true;
-  
+  let lease;
   try {
-    const slot = getCurrentSlot();
-    // FIX (fila travada / starvation): ORDER BY p.last_attempt_at ASC NULLS FIRST
-    // garante rotação justa entre as páginas pendentes do slot. Sem isso, como a
-    // query não tinha ordenação explícita, o Postgres devolvia consistentemente as
-    // mesmas linhas (praticamente a ordem física da tabela) — então páginas que
-    // falham sempre (ex: bloqueio da Meta numa URL específica) nunca saíam do topo
-    // do resultado e ocupavam o LIMIT 5 inteiro em TODO tick, travando a coleta de
-    // qualquer outra página pendente daquele slot. Agora, toda página tentada
-    // (sucesso ou falha) vai pro fim da fila, e páginas nunca tentadas (NULL) vêm
-    // primeiro.
-    const { rows: pages } = await query(`
-      SELECT p.slug, p.nome, p.url
-      FROM pages p
-      WHERE NOT EXISTS (
-        SELECT 1 FROM scrape_history sh 
-        WHERE sh.slug = p.slug 
-          AND sh.slot = $1 
-          AND sh.collected_at >= NOW() - INTERVAL '8 hours'
-      )
-      ORDER BY p.last_attempt_at ASC NULLS FIRST
-      LIMIT 5;
-    `, [slot]);
+    const now = new Date();
+    const brtHour = new Date(now.getTime() - 3 * 60 * 60 * 1000).getUTCHours();
+    const mode = brtHour >= 5 && brtHour < 6
+      ? "dominio"
+      : brtHour >= 6 && brtHour < 7
+        ? "keyword"
+        : "pagina";
+    const isScheduledSearchMode = mode !== "pagina";
+    console.log(`[TICK] modo ${mode} identificado`);
 
-    if (pages.length === 0) {
-      isRunning = false;
+    const { rows: cooldownRows } = await query(
+      `SELECT blocked_until FROM scrape_worker_lease WHERE lease_key = $1`,
+      [SCRAPE_LEASE_KEY],
+    );
+    const blockedUntil = cooldownRows[0]?.blocked_until
+      ? new Date(cooldownRows[0].blocked_until)
+      : null;
+    if (!isScheduledSearchMode && blockedUntil && blockedUntil.getTime() > Date.now()) {
+      console.warn(`[TICK] ignorado durante cooldown até ${blockedUntil.toISOString()}`);
       return;
     }
 
-    console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
-    const results = await processBatch(pages, slot);
+    if (isRunning) {
+      console.warn("[TICK] ignorado: já existe execução ativa nesta instância");
+      return;
+    }
+    lease = await acquireScrapeLease("cron");
+    if (!lease) {
+      console.warn("[TICK] ignorado: outra instância mantém a reserva durável do worker");
+      return;
+    }
+
+    const slotInfo = mode === "dominio"
+      ? getBusinessSlotForDomain(now)
+      : mode === "keyword"
+        ? getBusinessSlotForKeyword(now)
+        : getCurrentSlot(now);
+    const { rows: pages } = mode === "dominio"
+      ? await query(`
+          SELECT p.slug, p.nome, p.url
+          FROM pages p
+          WHERE p.tipo = 'dominio'
+            AND NOT EXISTS (
+              SELECT 1 FROM scrape_history sh
+              WHERE sh.slug = p.slug
+                AND sh.slot = 5
+                AND sh.business_date = $1
+            )
+          ORDER BY p.last_attempt_at ASC NULLS FIRST
+          LIMIT 5;
+        `, [slotInfo.businessDate])
+      : mode === "keyword"
+        ? await query(`
+            SELECT p.slug, p.nome, p.url
+            FROM pages p
+            WHERE p.tipo = 'keyword'
+              AND NOT EXISTS (
+                SELECT 1 FROM scrape_history sh
+                WHERE sh.slug = p.slug
+                  AND sh.slot = 6
+                  AND sh.business_date = $1
+              )
+            ORDER BY p.last_attempt_at ASC NULLS FIRST
+            LIMIT 5;
+          `, [slotInfo.businessDate])
+        : await query(`
+          SELECT p.slug, p.nome, p.url
+          FROM pages p
+          WHERE p.tipo = 'pagina'
+            AND NOT EXISTS (
+              SELECT 1 FROM scrape_history sh
+              WHERE sh.slug = p.slug
+                AND sh.slot = $1
+                AND sh.business_date = $2
+            )
+          ORDER BY p.last_attempt_at ASC NULLS FIRST
+          LIMIT 5;
+        `, [slotInfo.slot, slotInfo.businessDate]);
+
+    if (pages.length === 0) {
+      console.log(
+        mode === "dominio"
+          ? `[TICK-DOMINIO] nenhum domínio pendente para slot=5 date=${slotInfo.businessDate}`
+          : mode === "keyword"
+            ? `[TICK-KEYWORD] nenhuma palavra-chave pendente para slot=6 date=${slotInfo.businessDate}`
+            : `[TICK] nenhuma biblioteca pendente para slot=${slotInfo.slot} date=${slotInfo.businessDate}`,
+      );
+      return;
+    }
+
+    console.log(
+      mode === "dominio"
+        ? `[TICK-DOMINIO] Iniciando lote de domínios para slot=5 date=${slotInfo.businessDate}`
+        : mode === "keyword"
+          ? `[TICK-KEYWORD] Iniciando lote de palavras-chave para slot=6 date=${slotInfo.businessDate}`
+          : `[TICK] Iniciando lote de ${pages.length} páginas para slot=${slotInfo.slot} date=${slotInfo.businessDate}...`,
+    );
+    const results = await processBatch(pages, slotInfo, null, null, {
+      source: mode === "dominio" ? "cron_dominio" : mode === "keyword" ? "cron_keyword" : "cron",
+      lease,
+    });
     const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
     const metaRes = results.filter(r => metaSlugs.has(r.slug));
     const FALHAS_TECNICAS = ["falha_bloqueio", "falha_timeout", "falha_parse"];
-    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
-      blockedUntil = Date.now() + 90 * 60 * 1000;
-      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam (${metaRes.map(r => r.status).join(", ")}) — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+    if (mode === "pagina" && metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
+      const { rows } = await query(
+        `UPDATE scrape_worker_lease
+         SET blocked_until = NOW() + INTERVAL '90 minutes'
+         WHERE lease_key = $1 AND owner_id = $2
+         RETURNING blocked_until`,
+        [SCRAPE_LEASE_KEY, lease.ownerId],
+      );
+      if (rows[0]) {
+        console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam (${metaRes.map(r => r.status).join(", ")}) — cooldown de 90 min até ${new Date(rows[0].blocked_until).toISOString()}`);
+      }
     }
-    console.log(`[TICK] Lote do slot ${slot} finalizado.`);
+    console.log(`[TICK] Lote do slot=${slotInfo.slot} finalizado.`);
   } catch (err) {
     console.error("[TICK] Erro geral:", err);
   } finally {
-    isRunning = false;
+    if (lease) await lease.release();
   }
 });
+
+async function saveExtensionInitial(slug, count) {
+  const client = await pool.connect();
+  const attemptId = randomUUID();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+      [slug, count],
+    );
+    await client.query(
+      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (slug) DO UPDATE
+         SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+      [slug, count],
+    );
+    await client.query(
+      `INSERT INTO scrape_history (slug, ads_count, slot)
+       VALUES ($1, $2, NULL)`,
+      [slug, count],
+    );
+    await client.query(
+      `INSERT INTO scrape_attempts
+         (id, slug, source, status, ads_count, started_at, completed_at, lease_owner)
+       VALUES ($1, $2, 'cadastro_extensao', 'ok', $3, NOW(), NOW(), 'extension')`,
+      [attemptId, slug, count],
+    );
+    await client.query(
+      `UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok', last_error = NULL
+       WHERE slug = $1`,
+      [slug],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackError) => {
+      console.error(`[DESCOBERTA] rollback de contagem da extensão falhou: ${rollbackError.message}`);
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 app.post("/api/salvar", async (req, res) => {
   const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
   if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
-    const slug = toSlug(nome);
-  if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
-  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const tipoFinal = normalizeMonitoringType(tipo) || "pagina";
+  if (!toSlug(nome)) return res.status(400).json({ error: "Could not generate a valid slug." });
   const url = resolveMetaUrl(urlRaw, tipoFinal);
-  if (!url) return res.status(400).json({ error: "URL inválida: informe a URL da Meta Ad Library (facebook.com/ads/library) ou, para tipo dominio, apenas o domínio." });
-  await query(
-    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (slug) DO UPDATE
-       SET nome=$2, url=$3, tipo=$4,
-           instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
-           geo=COALESCE(EXCLUDED.geo, pages.geo),
-           nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
-           funil=COALESCE(EXCLUDED.funil, pages.funil)`,
-    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
-  );
-  console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
+  if (!url) return res.status(400).json({ error: "Entrada inválida: informe a URL da Meta Ad Library, um domínio ou uma palavra-chave conforme o tipo selecionado." });
+  try {
+    const record = await saveMonitoringRecord({
+      nome,
+      url,
+      tipo: tipoFinal,
+      instagram_url: instagram_url || null,
+      geo: geo || null,
+      nicho: nicho || null,
+      funil: funil || null,
+    });
+    console.log(`[SALVAR] registered slug=${record.slug} tipo=${tipoFinal}`);
 
-  let inicial = ads_count_inicial;
-  if (inicial !== undefined && inicial !== null) {
-    const countNum = parseInt(inicial, 10) || 0;
-    await query(
-      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
-      [slug, countNum]
-    );
-    await query(
-      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE
-         SET ads_count    = EXCLUDED.ads_count,
-             collected_at = EXCLUDED.collected_at`,
-      [slug, countNum]
-    );
-    await query(
-      `INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, NULL)`,
-      [slug, countNum]
-    );
-    inicial = countNum;
-    console.log(`[DESCOBERTA] slug=${slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
-  } else {
-    inicial = await captureInicial(slug, url);
+    if (tipoFinal === "keyword") {
+      captureInicial(record.slug, url).catch((err) => {
+        console.error(`[DESCOBERTA] falha ao iniciar captura de keyword ${record.slug}: ${err.message}`);
+      });
+      return res.status(202).json({
+        slug: record.slug,
+        tipo: tipoFinal,
+        keyword_key: record.keyword_key,
+        inicial: null,
+        coletarPath: `/api/coletar/${record.slug}`,
+      });
+    }
+
+    let inicial = ads_count_inicial;
+    if (inicial !== undefined && inicial !== null) {
+      const countNum = parseInt(inicial, 10) || 0;
+      await saveExtensionInitial(record.slug, countNum);
+      inicial = countNum;
+      console.log(`[DESCOBERTA] slug=${record.slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
+    } else {
+      inicial = await captureInicial(record.slug, url);
+    }
+    return res.json({ slug: record.slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${record.slug}` });
+  } catch (err) {
+    console.error(`[SALVAR] erro ao registrar tipo=${tipoFinal}: ${err.message}`);
+    return res.status(500).json({ error: "Não foi possível salvar o monitoramento." });
   }
-
-  res.json({ slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${slug}` });
 });
 
 app.get("/api/coletar/:slug", async (req, res) => {
   const { slug } = req.params;
-  const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
-  const row = rows[0];
-  if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
+  let lease;
   try {
-    const count = await scrapeAdCount(row.url);
-    if (count === null) return res.status(502).type("text/plain").send("FALHA");
-    res.type("text/plain").send(String(count));
-    await query(
-      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE
-         SET ads_count    = EXCLUDED.ads_count,
-             collected_at = EXCLUDED.collected_at`,
-      [slug, count]
+    lease = await acquireScrapeLease("manual_individual");
+    if (!lease) return res.status(409).type("text/plain").send("OCUPADO");
+    const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
+    const row = rows[0];
+    if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
+    const [result] = await processBatch(
+      [{ slug: row.slug, nome: row.nome, url: row.url }],
+      null,
+      null,
+      null,
+      { source: "manual_individual", lease },
     );
-    console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
-    
-    // FIX: coleta manual bem-sucedida também limpa o estado de falha em pages,
-    // senão o dashboard continua exibindo "tentou ... falhou" com o dado já atualizado.
-    await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok', last_error = NULL WHERE slug = $1`, [slug]);
+    if (result.count === null) return res.status(502).type("text/plain").send("FALHA");
+    return res.type("text/plain").send(String(result.count));
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
-    res.status(500).type("text/plain").send("FALHA");
+    return res.status(500).type("text/plain").send("FALHA");
+  } finally {
+    if (lease) await lease.release();
   }
 });
 
-app.get("/api/coletar-tudo", async (_req, res) => {
-  if (isRunning) {
+function manualCheckFailureMessage(status) {
+  const messages = {
+    falha_bloqueio: "A Meta não permitiu acessar a biblioteca durante a checagem.",
+    falha_timeout: "A página não respondeu dentro do tempo limite. Tente novamente.",
+    falha_parse: "Não foi possível identificar a contagem de anúncios.",
+    falha_url_invalida: "A URL cadastrada não é uma biblioteca válida.",
+    falha_gravacao: "A coleta foi feita, mas não foi possível salvar o resultado.",
+    falha_execucao: "A execução foi interrompida antes de concluir a coleta.",
+  };
+  return messages[status] || "Não foi possível concluir a coleta. Tente novamente.";
+}
+
+function fingerprintManualPages(pages) {
+  const canonical = pages
+    .map(({ slug, nome, url }) => [slug, nome, url])
+    .sort(([leftSlug], [rightSlug]) => leftSlug < rightSlug ? -1 : leftSlug > rightSlug ? 1 : 0);
+  return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
+function addManualCheckResult(result) {
+  const sucesso = result.count !== null && !result.dbError;
+  const resultado = {
+    slug: result.slug,
+    nome: result.nome,
+    count: sucesso ? result.count : null,
+    status: result.status || (sucesso ? "ok" : "falha_execucao"),
+    falha: sucesso ? null : manualCheckFailureMessage(result.status),
+  };
+  const results = [...manualCheckStatus.resultados];
+  const previousIndex = results.findIndex((item) => item.slug === result.slug);
+  const jaDeuCertoAntes = previousIndex !== -1 && results[previousIndex].count !== null;
+
+  if (previousIndex === -1) {
+    results.push(resultado);
+  } else if (jaDeuCertoAntes && !sucesso) {
+    // Já deu certo antes, não sobrescreve com falha - mantém sucesso
+  } else {
+    results[previousIndex] = resultado;
+  }
+  const sucessoCount = results.filter((item) => item.count !== null).length;
+  manualCheckStatus = {
+    ...manualCheckStatus,
+    resultados: results,
+    concluidos: results.length,
+    sucesso: sucessoCount,
+    falha: results.length - sucessoCount,
+    atual: result.nome,
+  };
+}
+
+async function startManualCheck(req, res) {
+  const requestId = req.method === "POST" && req.body ? req.body.requestId : null;
+  if (req.method === "POST" && (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId))) {
+    return res.status(400).json({ status: "invalid_request", message: "Identificador de execução inválido. Confirme novamente a checagem." });
+  }
+
+  const hasSelection = req.method === "POST" && req.body && Object.prototype.hasOwnProperty.call(req.body, "slugs");
+  const hasSnapshot = req.method === "POST" && req.body
+    && Object.prototype.hasOwnProperty.call(req.body, "snapshotHash")
+    && Object.prototype.hasOwnProperty.call(req.body, "snapshotCount");
+  let selectedSlugs = null;
+  let expectedSnapshotHash = null;
+  let expectedSnapshotCount = null;
+  if (hasSelection) {
+    const requestedSlugs = req.body.slugs;
+    if (!Array.isArray(requestedSlugs) || requestedSlugs.length === 0 || requestedSlugs.length > 500
+      || requestedSlugs.some((slug) => typeof slug !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug))) {
+      return res.status(400).json({ status: "invalid_selection", message: "Selecione ao menos uma biblioteca válida." });
+    }
+    selectedSlugs = [...new Set(requestedSlugs)];
+  }
+  if (req.method === "POST" && !hasSnapshot) {
+    return res.status(400).json({ status: "invalid_selection", message: "Confirme novamente a lista antes de iniciar a checagem." });
+  }
+  if (hasSnapshot) {
+    if (typeof req.body.snapshotHash !== "string" || !/^[a-f0-9]{64}$/i.test(req.body.snapshotHash)
+      || !Number.isSafeInteger(req.body.snapshotCount) || req.body.snapshotCount < 1) {
+      return res.status(400).json({ status: "invalid_selection", message: "Não foi possível validar a lista confirmada. Revise a checagem." });
+    }
+    expectedSnapshotHash = req.body.snapshotHash.toLowerCase();
+    expectedSnapshotCount = req.body.snapshotCount;
+  }
+  const requestSignature = createHash("sha256").update(JSON.stringify({
+    slugs: selectedSlugs ? [...selectedSlugs].sort() : null,
+    snapshotHash: expectedSnapshotHash,
+    snapshotCount: expectedSnapshotCount,
+  }), "utf8").digest("hex");
+  const previousRequest = manualCheckRequestLedger.get(requestId);
+  if (previousRequest) {
+    if (previousRequest.signature !== requestSignature) {
+      return res.status(409).json({ status: "request_conflict", message: "Este identificador já foi usado com outra lista. Reconfirme a checagem." });
+    }
+    return res.status(202).json({ status: "started", runId: previousRequest.runId, escopo: previousRequest.escopo });
+  }
+  let lease;
+  try {
+    lease = await acquireScrapeLease("manual_lote");
+  } catch (err) {
+    console.error(`[RUN] não foi possível reservar worker: ${err.message}`);
+    return res.status(503).json({ status: "error", message: "Não foi possível iniciar a checagem. Tente novamente." });
+  }
+  if (!lease) {
     return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
-  isRunning = true;
-  res.json({ status: "started" });
+
+  let pages;
+  try {
+    const result = selectedSlugs
+      ? await query("SELECT slug, nome, url FROM pages WHERE slug = ANY($1) ORDER BY tipo, nome", [selectedSlugs])
+      : await query("SELECT slug, nome, url FROM pages ORDER BY tipo, nome");
+    pages = result.rows;
+  } catch (err) {
+    await lease.release();
+    console.error(`[RUN] não foi possível carregar bibliotecas: ${err.message}`);
+    return res.status(500).json({ status: "error", message: "Não foi possível carregar as bibliotecas." });
+  }
+
+  if (selectedSlugs && pages.length !== selectedSlugs.length) {
+    await lease.release();
+    return res.status(400).json({ status: "invalid_selection", message: "Uma ou mais bibliotecas selecionadas não existem." });
+  }
+  if (expectedSnapshotHash && (pages.length !== expectedSnapshotCount || fingerprintManualPages(pages) !== expectedSnapshotHash)) {
+    await lease.release();
+    return res.status(409).json({ status: "selection_changed", message: "A lista de bibliotecas mudou após a confirmação. Revise a lista completa e confirme outra vez." });
+  }
+
+  const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const escopo = selectedSlugs ? "selecionadas" : "todas";
+  manualCheckRequestLedger.set(requestId, { signature: requestSignature, runId, escopo, state: null });
+  if (manualCheckRequestLedger.size > MANUAL_CHECK_REQUEST_LEDGER_LIMIT) {
+    manualCheckRequestLedger.delete(manualCheckRequestLedger.keys().next().value);
+  }
+  manualCheckStatus = {
+    runId,
+    requestId,
+    status: "running",
+    escopo,
+    total: 0,
+    concluidos: 0,
+    sucesso: 0,
+    falha: 0,
+    atual: null,
+    resultados: [],
+    iniciadoEm: new Date().toISOString(),
+    finalizadoEm: null,
+    erro: null,
+  };
+  res.status(req.method === "POST" ? 202 : 200).json({ status: "started", runId, escopo: manualCheckStatus.escopo });
 
   (async () => {
     try {
-      const { rows: pages } = await query(`SELECT slug, nome, url FROM pages`);
+      manualCheckStatus = { ...manualCheckStatus, total: pages.length };
       if (pages.length === 0) {
-        console.log("[RUN] coleta-tudo: nenhuma página cadastrada");
+        console.log("[RUN] checagem manual sem bibliotecas selecionadas");
+        manualCheckStatus = { ...manualCheckStatus, status: "completed" };
         return;
       }
 
-      const CHUNK_SIZE = 5; // mesmo tamanho de lote usado pelo cron — navegador é reiniciado a cada lote
-      console.log(`[RUN] coleta-tudo manual iniciada — ${pages.length} páginas, em lotes de ${CHUNK_SIZE}`);
-
-      let processadas = 0;
-      for (let i = 0; i < pages.length; i += CHUNK_SIZE) {
-        const lote = pages.slice(i, i + CHUNK_SIZE);
-        await processBatch(lote, null);
-        processadas += lote.length;
-        console.log(`[RUN] coleta-tudo progresso: ${processadas}/${pages.length}`);
-      }
+      const BATCH_SIZE = 5;
+      console.log(`[RUN] checagem manual iniciada — ${pages.length} bibliotecas, blocos de ${BATCH_SIZE}; retentativas somente após a primeira passagem completa`);
+      await processBatch(
+        pages,
+        null,
+        addManualCheckResult,
+        (page) => { manualCheckStatus = { ...manualCheckStatus, atual: page.nome }; },
+        { source: "manual_lote", lease },
+      );
 
       console.log(`[RUN] coleta-tudo manual finalizada — ${pages.length} páginas`);
+      manualCheckStatus = {
+        ...manualCheckStatus,
+        status: manualCheckStatus.falha > 0 ? "completed_with_errors" : "completed",
+      };
     } catch (e) {
       console.error("[RUN] manual error:", e.message);
+      manualCheckStatus = {
+        ...manualCheckStatus,
+        status: manualCheckStatus.concluidos > 0 ? "completed_with_errors" : "failed",
+        erro: "Falha ao consultar ou processar as bibliotecas. Consulte os logs do serviço.",
+      };
     } finally {
-      isRunning = false;
+      await lease.release();
+      manualCheckStatus = {
+        ...manualCheckStatus,
+        atual: null,
+        finalizadoEm: new Date().toISOString(),
+      };
+      const completedRequest = manualCheckRequestLedger.get(manualCheckStatus.requestId);
+      if (completedRequest) completedRequest.state = { ...manualCheckStatus, ocupado: false };
     }
   })();
+}
+
+app.post("/api/coletar-tudo", startManualCheck);
+app.get("/api/coletar-tudo", (_req, res) => res.status(405).json({ status: "confirmation_required", message: "Confirme a lista de bibliotecas antes de iniciar a checagem." }));
+app.get("/api/coletar-tudo/status", (req, res) => {
+  const requestedId = typeof req.query.requestId === "string" ? req.query.requestId : null;
+  const requestEntry = requestedId ? manualCheckRequestLedger.get(requestedId) : null;
+  if (requestedId && !requestEntry) {
+    return res.status(404).json({ status: "unknown_run", message: "A execução solicitada não está mais disponível." });
+  }
+  const isCurrentRun = !!requestEntry && manualCheckStatus.requestId === requestedId;
+  const status = requestEntry
+    ? (isCurrentRun ? manualCheckStatus : requestEntry.state || manualCheckStatus)
+    : manualCheckStatus;
+  const emExecucao = status.status === "running";
+  res.json({
+    ...status,
+    resultados: emExecucao ? status.resultados.slice(-15) : status.resultados,
+    totalResultados: status.resultados.length,
+    ocupado: isCurrentRun ? isRunning : requestedId ? false : isRunning,
+  });
 });
 
 app.get("/api/historico/:slug", async (req, res) => {
@@ -1023,10 +1787,9 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/paginas", async (_req, res) => {
-  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil FROM pages");
-  res.json(rows);
+  const { rows } = await query("SELECT slug, nome, url, tipo, keyword_key, instagram_url, geo, nicho, funil FROM pages");
+  res.set("Cache-Control", "no-store").json(rows);
 });
-
 // ─── Admin ───────────────────────────────────────────────────────────────────
 
 app.get("/admin", async (_req, res) => {
@@ -1034,14 +1797,13 @@ app.get("/admin", async (_req, res) => {
     "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, created_at FROM pages ORDER BY tipo, created_at DESC"
   );
 
-  // JSON de cada item, embutido no atributo data-item, usado pelo JS para preencher o formulário ao clicar em Editar
   function escAttr(str) {
     return String(str ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   const lista = pages.map(p => `
-    <tr>
-      <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : "📡 Biblioteca"}</span></td>
+    <tr data-search="${escAttr((p.nome + " " + p.url + " " + (p.geo||"") + " " + (p.nicho||"")).toLowerCase())}">
+      <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : p.tipo === "keyword" ? "b-key" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : p.tipo === "keyword" ? "🔑 Palavra-chave" : "📡 Biblioteca"}</span></td>
       <td class="nome-cell">
         <div class="nome">${p.nome}</div>
         <div class="meta-badges">
@@ -1066,10 +1828,10 @@ app.get("/admin", async (_req, res) => {
           data-funil="${escAttr(p.funil)}"
           onclick="editarItem(this)">✏️ Editar</button>
         <a href="/admin/funis/${p.slug}" class="btn-funis">🔀 Funis</a>
-        <form method="POST" action="/admin/remover" style="display:inline" onsubmit="return confirm('Remover ${p.nome}?')">
+        <form id="form-remover-${escAttr(p.slug)}" method="POST" action="/admin/remover" style="display:none">
           <input type="hidden" name="slug" value="${p.slug}">
-          <button type="submit" class="btn-del">Remover</button>
         </form>
+        <button type="button" class="btn-del" data-slug="${escAttr(p.slug)}" data-nome="${escAttr(p.nome)}" onclick="abrirModalRemoverAdmin(this)">Remover</button>
       </td>
     </tr>`).join("");
 
@@ -1080,7 +1842,7 @@ app.get("/admin", async (_req, res) => {
     if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
     if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
     if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
-    if (q.erro === "url-invalida") return '<div class="msg err">⚠️ URL inválida. Use a URL da Meta Ad Library (facebook.com/ads/library) ou, para Domínio, apenas o domínio (ex: site.com).</div>';
+    if (q.erro === "url-invalida") return '<div class="msg err">⚠️ Entrada inválida. Use a URL da Meta Ad Library, um domínio ou uma palavra-chave conforme o tipo selecionado.</div>';
     if (q.erro === "lote-vazio") return '<div class="msg err">⚠️ Nenhum item enviado no lote.</div>';
     if (q.erro === "lote-invalido") return '<div class="msg err">⚠️ Nenhuma linha válida encontrada no lote.</div>';
     if (q.erro === "lote-em-andamento") return '<div class="msg err">⚠️ Já existe um lote em andamento. Aguarde terminar.</div>';
@@ -1093,7 +1855,7 @@ app.get("/admin", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NUTRA MONITOR — Admin</title>
+<title>Lowticket Monitor — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1136,17 +1898,48 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 .url-link:hover{text-decoration:underline}
 .badge{display:inline-block;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:600}
 .b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-key{background:rgba(251,191,36,.14);color:#fbbf24}
 .b-pag{background:rgba(52,211,153,.12);color:#34d399}
 .msg{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:18px}
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px}
 .divider{border:none;border-top:1px solid var(--border);margin:16px 0}
+.search-wrap{position:relative;margin-bottom:16px}
+.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none}
+.search-wrap input{width:100%;padding:10px 14px 10px 38px;border-radius:10px;background:#0f0f1e;border:1px solid var(--border);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;outline:none;transition:.18s;box-sizing:border-box}
+.search-wrap input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,111,255,.15)}
+.search-wrap input::placeholder{color:var(--muted)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:9999;opacity:0;pointer-events:none;transition:opacity .2s ease}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal-card{background:#1c1c2e;border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:30px 28px 24px;max-width:360px;width:calc(100% - 40px);box-shadow:0 40px 100px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.06);transform:scale(.92) translateY(12px);transition:transform .28s cubic-bezier(.34,1.4,.64,1),opacity .22s ease;opacity:0;text-align:center}
+.modal-overlay.open .modal-card{transform:scale(1) translateY(0);opacity:1}
+.modal-icon{font-size:38px;margin-bottom:14px;line-height:1}
+.modal-title{font-size:16px;font-weight:700;color:#fff;margin-bottom:8px;letter-spacing:-.2px}
+.modal-desc{font-size:13px;color:#8888aa;margin-bottom:24px;line-height:1.6;word-break:break-word}
+.modal-desc b{color:#fb7185}
+.modal-actions{display:flex;gap:10px}
+.modal-btn-cancel{flex:1;background:rgba(255,255,255,.07);color:#e0e0f0;border:1px solid rgba(255,255,255,.1);border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:12px 0;cursor:pointer;transition:background .15s}
+.modal-btn-cancel:hover{background:rgba(255,255,255,.13)}
+.modal-btn-confirm{flex:1;background:#fb7185;color:#fff;border:none;border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;padding:12px 0;cursor:pointer;transition:background .15s,transform .1s}
+.modal-btn-confirm:hover{background:#f43f5e}
+.modal-btn-confirm:active{transform:scale(.97)}
 </style>
 </head>
 <body>
+<div class="modal-overlay" id="modal-remover-admin" onclick="fecharModalRemoverOverlayAdmin(event)">
+  <div class="modal-card">
+    <div class="modal-icon">🗑️</div>
+    <h3 class="modal-title">Remover rastreamento</h3>
+    <p class="modal-desc" id="modal-remover-admin-desc"></p>
+    <div class="modal-actions">
+      <button class="modal-btn-cancel" onclick="fecharModalRemoverAdmin()">Cancelar</button>
+      <button class="modal-btn-confirm" onclick="confirmarRemoverAdminFinal()">Remover</button>
+    </div>
+  </div>
+</div>
 <div class="hdr">
-  <h1>⚙️ Admin — NUTRA MONITOR</h1>
+  <h1>⚙️ Admin — Lowticket Monitor</h1>
   <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
     <a href="/dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">← Ver Dashboard</a>
     <a href="/funis" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">🔀 Ver Mapa de Funis</a>
@@ -1165,6 +1958,7 @@ ${msgOk}
         <select name="tipo" id="tipoSelect" onchange="atualizarDica()">
           <option value="pagina">📡 Biblioteca (página)</option>
           <option value="dominio">🌐 Domínio (URL)</option>
+          <option value="keyword">🔑 Palavra-chave</option>
         </select>
       </div>
       <div class="field">
@@ -1172,7 +1966,7 @@ ${msgOk}
         <input type="text" name="nome" id="nomeInput" placeholder="Ex: FlowForce Max ou FLOWFORCE.COM" required>
       </div>
       <div class="field">
-        <label>URL da Meta Ad Library</label>
+        <label id="urlLabel">URL da Meta Ad Library</label>
         <input type="text" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
       </div>
     </div>
@@ -1221,8 +2015,10 @@ ${msgOk}
       💡 Formatos aceitos por linha:<br>
       <code>Nome | URL da Meta Ad Library</code><br>
       <code>Nome | URL da Meta Ad Library | https://instagram.com/perfil</code><br>
-      <code>tipo | Nome | URL | https://instagram.com/perfil</code><br><br>
-      O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL. O Instagram é opcional — basta omitir.<br>
+      <code>tipo | Nome | URL | https://instagram.com/perfil</code><br>
+      <code>keyword | Jejum Intermitente</code><br>
+      <code>palavra | Jejum | URL da Meta Ad Library</code><br><br>
+      O tipo (Biblioteca, Domínio ou Palavra-chave) é detectado automaticamente pela URL quando possível. O Instagram é opcional — basta omitir.<br>
       Geo e Nicho só podem ser preenchidos após o cadastro, editando o item individualmente no admin.<br>
       Cada item leva ~15-20s pra processar. A página não precisa ficar aberta.
     </div>
@@ -1239,10 +2035,15 @@ ${msgOk}
 <div class="card">
   <h2>📋 Rastreamentos cadastrados (${pages.length})</h2>
   ${pages.length === 0 ? '<div class="empty">Nenhum rastreamento cadastrado ainda.</div>' : `
+  <div class="search-wrap">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+    <input type="text" id="buscaRastreios" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarRastreios()">
+  </div>
   <table>
     <thead><tr><th>Tipo</th><th>Nome / Metadados</th><th>Link Meta</th><th>Cadastrado</th><th></th></tr></thead>
-    <tbody>${lista}</tbody>
-  </table>`}
+    <tbody id="tbody-rastreios">${lista}</tbody>
+  </table>
+  <div class="empty" id="busca-rastreios-vazio" style="display:none">Nenhum resultado encontrado.</div>`}
 </div>
 
 <script>
@@ -1250,11 +2051,18 @@ function atualizarDica(){
   const tipo=document.getElementById('tipoSelect').value;
   const dica=document.getElementById('dica');
   const url=document.getElementById('urlInput');
+  const urlLabel=document.getElementById('urlLabel');
   if(tipo==='dominio'){
     dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
+    urlLabel.textContent='URL da Meta Ad Library ou domínio';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM...';
+  }else if(tipo==='keyword'){
+    dica.textContent="💡 Palavra-chave: Digite apenas a palavra ou frase. O sistema monta a busca na Biblioteca automaticamente. Ex: 'ansiedade' vira busca por todos os anúncios ativos com essa palavra.";
+    urlLabel.textContent='Palavra-chave ou URL da Meta Ad Library';
+    url.placeholder='Ex: jejum intermitente, biblia explicada, ansiedade';
   }else{
     dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
+    urlLabel.textContent='URL da Meta Ad Library';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&id=...';
   }
 }
@@ -1281,6 +2089,40 @@ function cancelarEdicao(){
   document.getElementById('submitBtn').textContent='Cadastrar';
   document.getElementById('cancelBtn').style.display='none';
   atualizarDica();
+}
+  
+function filtrarRastreios(){
+  const termo=document.getElementById('buscaRastreios').value.trim().toLowerCase();
+  const linhas=document.querySelectorAll('#tbody-rastreios tr');
+  let visiveis=0;
+  linhas.forEach(function(tr){
+    const match=!termo||(tr.dataset.search||'').includes(termo);
+    tr.style.display=match?'':'none';
+    if(match)visiveis++;
+  });
+  document.getElementById('busca-rastreios-vazio').style.display=visiveis===0?'block':'none';
+}
+
+var _slugParaRemoverAdmin=null;
+function abrirModalRemoverAdmin(btn){
+  _slugParaRemoverAdmin=btn.dataset.slug;
+  document.getElementById('modal-remover-admin-desc').innerHTML=
+    'Tem certeza que deseja remover <b>'+btn.dataset.nome+'</b>? Todo o histórico de coletas e dados desta biblioteca serão perdidos permanentemente.';
+  document.getElementById('modal-remover-admin').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function fecharModalRemoverAdmin(){
+  document.getElementById('modal-remover-admin').classList.remove('open');
+  document.body.style.overflow='';
+  _slugParaRemoverAdmin=null;
+}
+function fecharModalRemoverOverlayAdmin(e){
+  if(e.target===document.getElementById('modal-remover-admin'))fecharModalRemoverAdmin();
+}
+function confirmarRemoverAdminFinal(){
+  if(!_slugParaRemoverAdmin)return;
+  const frm=document.getElementById('form-remover-'+_slugParaRemoverAdmin);
+  if(frm)frm.submit();
 }
 
 (function iniciarPollingLote(){
@@ -1315,19 +2157,18 @@ function cancelarEdicao(){
 });
 
 app.post("/admin/salvar", async (req, res) => {
-    const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
+  const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
   if (!nome || !urlRaw) return res.redirect("/admin?erro=campos-obrigatorios");
-  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const tipoFinal = normalizeMonitoringType(tipo) || "pagina";
   const url = resolveMetaUrl(urlRaw, tipoFinal);
   if (!url) return res.redirect("/admin?erro=url-invalida");
 
-  // Modo edição: atualiza o registro existente pelo slug original — o slug NUNCA muda,
-  // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
   if (original_slug && original_slug.trim()) {
     try {
+      const keywordKey = tipoFinal === "keyword" ? normalizeKeywordIdentity(nome) : null;
       const { rowCount } = await query(
-        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7 WHERE slug=$8`,
-        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, original_slug.trim()]
+        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7, keyword_key=$8 WHERE slug=$9`,
+        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, keywordKey, original_slug.trim()]
       );
       if (rowCount === 0) {
         console.warn(`[ADMIN] edição falhou — slug=${original_slug} não encontrado`);
@@ -1341,23 +2182,19 @@ app.post("/admin/salvar", async (req, res) => {
     }
   }
 
-  // Modo cadastro (novo item)
-  const slug = toSlug(nome);
-  if (!slug) return res.redirect("/admin?erro=nome-invalido");
+  if (!toSlug(nome)) return res.redirect("/admin?erro=nome-invalido");
   try {
-    await query(
-      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (slug) DO UPDATE
-         SET nome=$2, url=$3, tipo=$4,
-             instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
-             geo=COALESCE(EXCLUDED.geo, pages.geo),
-             nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
-             funil=COALESCE(EXCLUDED.funil, pages.funil)`,
-      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
-    );
-    console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
-    await captureInicial(slug, url);
+    const record = await saveMonitoringRecord({
+      nome,
+      url,
+      tipo: tipoFinal,
+      instagram_url: instagram_url || null,
+      geo: geo || null,
+      nicho: nicho || null,
+      funil: funil || null,
+    });
+    console.log(`[ADMIN] cadastrou slug=${record.slug} tipo=${tipoFinal}`);
+    await captureInicial(record.slug, url);
     res.redirect("/admin?ok=1");
   } catch (err) {
     console.error("[ADMIN] erro:", err.message);
@@ -1403,9 +2240,6 @@ const TIPO_INFO = {
 };
 const TIPOS_ORDEM = ["ads", "advertorial", "presell", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
 
-// Computa todos os caminhos (raiz → folha) de um grafo de nós/conexões.
-// Raiz = nó sem conexão de entrada. Folha = nó sem conexão de saída.
-// Guarda contra ciclos interrompendo o caminho se o nó já apareceu nele.
 function computarCaminhos(nodes, edges) {
   const nodesById = {};
   nodes.forEach(n => { nodesById[n.id] = n; });
@@ -1584,7 +2418,7 @@ function renderCaminho(funilItem, idx = 0, isEditMode = false, explicitSlug = ""
   }
 
   const slug = explicitSlug || allNodes[0]?.slug || "";
-  const label = allNodes.map(n => n.rotulo).join(' \u2192 ');
+  const label = allNodes.map(n => n.rotulo).join(' → ');
   const levelsJson = JSON.stringify(levels.map(lvl => lvl.map(n => n.id)));
   const allIdsJson = JSON.stringify(allNodes.map(n => n.id));
 
@@ -1601,17 +2435,16 @@ function renderCaminho(funilItem, idx = 0, isEditMode = false, explicitSlug = ""
       ${treeHtml}
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0">
-      <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
+      <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">✏️ Editar</button>
       <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
         <input type="hidden" name="slug" value="${slug}">
         <input type="hidden" name="funil_node_ids" value='${allIdsJson}'>
       </form>
-      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir funil mapeado', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir funil mapeado', '${label.replace(/'/g, "\\'")}')">✕ Excluir</button>
     </div>
   </div>`;
 }
 
-// Página de gerenciamento de nós/conexões de um player
 app.get("/admin/funis/:slug", async (req, res) => {
   const { slug } = req.params;
   const { rows: pages } = await query("SELECT nome, url FROM pages WHERE slug=$1 LIMIT 1", [slug]);
@@ -1646,7 +2479,7 @@ app.get("/admin/funis/:slug", async (req, res) => {
   const listaEdges = edges.length ? edges.map(e => {
     const de = nodesById[e.from_node_id], para = nodesById[e.to_node_id];
     if (!de || !para) return "";
-    const label = de.rotulo + ' \u2192 ' + para.rotulo;
+    const label = de.rotulo + ' → ' + para.rotulo;
     return `<div class="edge-row">
       ${renderChip(de)}<span class="chip-arrow">→</span>${renderChip(para)}
       <form id="form-rem-${e.id}" method="POST" action="/admin/funis/remover-edge" style="display:none">
@@ -1743,7 +2576,6 @@ input::placeholder{color:var(--muted)}
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .divider{border:none;border-top:1px solid var(--border);margin:14px 0}
-/* Modal Apple-style */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:9999;opacity:0;pointer-events:none;transition:opacity .2s ease}
 .modal-overlay.open{opacity:1;pointer-events:all}
 .modal-card{background:#1c1c2e;border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:30px 28px 24px;max-width:340px;width:calc(100% - 40px);box-shadow:0 40px 100px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.06);transform:scale(.92) translateY(12px);transition:transform .28s cubic-bezier(.34,1.4,.64,1),opacity .22s ease;opacity:0;text-align:center}
@@ -1760,7 +2592,6 @@ input::placeholder{color:var(--muted)}
 </style>
 </head>
 <body>
-<!-- Modal Apple-style universal -->
 <div class="modal-overlay" id="modal-remover-apple" onclick="fecharModalAppleOverlay(event)">
   <div class="modal-card">
     <div class="modal-icon">🗑️</div>
@@ -1855,7 +2686,7 @@ function adicionarElo(val){
   var addBtn=document.getElementById('btn-chain-add');
   var arrow=document.createElement('div');
   arrow.className='chain-arrow';
-  arrow.textContent='\u2192';
+  arrow.textContent='→';
   var elo=document.createElement('div');
   elo.className='chain-elo';
   elo.id='chain-elo-'+_chainCount;
@@ -1877,7 +2708,7 @@ function adicionarElo(val){
   var remBtn=document.createElement('button');
   remBtn.type='button';
   remBtn.className='btn-chain-rem';
-  remBtn.textContent='\u2715';
+  remBtn.textContent='✕';
   remBtn.title='Remover esta etapa';
   remBtn.onclick=function(){arrow.remove();elo.remove();renumerarCadeia();};
   elo.appendChild(lbl);
@@ -1899,7 +2730,7 @@ function bifurcarElo(btnEl){
   rm.type='button';
   rm.className='btn-chain-rem';
   rm.style.padding='2px 6px';
-  rm.textContent='\u2715';
+  rm.textContent='✕';
   rm.onclick=function(){row.remove();};
   row.appendChild(sel);
   row.appendChild(rm);
@@ -1920,7 +2751,7 @@ function editarFunil(levels){
     if(idx > 0){
       var arrow=document.createElement('div');
       arrow.className='chain-arrow';
-      arrow.textContent='\u2192';
+      arrow.textContent='→';
       builder.appendChild(arrow);
     }
     _chainCount++;
@@ -1946,7 +2777,7 @@ function editarFunil(levels){
         rm.type='button';
         rm.className='btn-chain-rem';
         rm.style.padding='2px 6px';
-        rm.textContent='\u2715';
+        rm.textContent='✕';
         rm.onclick=function(){row.remove();};
         row.appendChild(sel);
         row.appendChild(rm);
@@ -1968,7 +2799,7 @@ function editarFunil(levels){
       var remEloBtn=document.createElement('button');
       remEloBtn.type='button';
       remEloBtn.className='btn-chain-rem';
-      remEloBtn.textContent='\u2715';
+      remEloBtn.textContent='✕';
       remEloBtn.title='Remover esta etapa';
       remEloBtn.onclick=function(){elo.previousSibling?.remove();elo.remove();renumerarCadeia();};
       elo.appendChild(remEloBtn);
@@ -1997,7 +2828,6 @@ function editarFunil(levels){
 }
 function editarCaminho(ids){ editarFunil(ids); }
 
-/* ── Modal Apple-style para remover ── */
 var _itemToRemove=null;
 function abrirModalRemover(tipo,id,titulo,descricao){
   _itemToRemove={tipo:tipo, id:id};
@@ -2021,7 +2851,6 @@ function confirmarRemoverApple(){
   var frm = document.getElementById('form-rem-'+_itemToRemove.tipo+'-'+_itemToRemove.id);
   if(frm) frm.submit();
 }
-/* Restaurar posição do scroll após redirect sem pular para o topo */
 function restoreScrollPosition(){
   var y=sessionStorage.getItem('funil_scroll_y');
   if(y!==null){
@@ -2143,37 +2972,52 @@ app.post("/admin/funis/remover-caminho", async (req, res) => {
 });
 
 app.post("/api/funis/salvar-node", async (req, res) => {
-  const { slug, tipo, rotulo, url: urlRaw, checkout_url: checkoutRaw } = req.body;
-  if (!slug || !tipo || !rotulo || !urlRaw) {
+  const { slug, tipo, rotulo: rotuloRaw, url: urlRaw, checkout_url: checkoutRaw } = req.body;
+  if (!slug || !tipo || !urlRaw) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (!rotuloRaw && tipo !== "ads") {
     return res.status(400).json({ error: "Missing required fields" });
   }
   const url = normalizeUrl(urlRaw);
   const checkout_url = checkoutRaw ? normalizeUrl(checkoutRaw) : checkoutRaw;
 
   try {
-    // 1. Resolve ou cria o nó da Landing Page
     let landingNodeId;
+    let rotuloResolvido = rotuloRaw || null;
     const { rows: existingLanding } = await query(
-      "SELECT id FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
+      "SELECT id, rotulo FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
       [slug, url]
     );
 
     if (existingLanding.length > 0) {
       landingNodeId = existingLanding[0].id;
-      // Atualiza o tipo e rótulo caso tenham mudado
-      await query(
-        "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
-        [tipo, rotulo, landingNodeId]
-      );
+      rotuloResolvido = existingLanding[0].rotulo;
+      if (rotuloRaw) {
+        await query(
+          "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
+          [tipo, rotuloRaw, landingNodeId]
+        );
+        rotuloResolvido = rotuloRaw;
+      }
     } else {
+      let rotuloFinal = rotuloRaw;
+      if (!rotuloFinal && tipo === "ads") {
+        const { rows: countRows } = await query(
+          "SELECT COUNT(*)::int AS n FROM funnel_nodes WHERE slug = $1 AND tipo = 'ads'",
+          [slug]
+        );
+        const proximoNumero = (countRows[0]?.n || 0) + 1;
+        rotuloFinal = `ads${String(proximoNumero).padStart(2, "0")}`;
+      }
       const { rows: newLanding } = await query(
         "INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1, $2, $3, $4) RETURNING id",
-        [slug, tipo, rotulo, url]
+        [slug, tipo, rotuloFinal, url]
       );
       landingNodeId = newLanding[0].id;
+      rotuloResolvido = rotuloFinal;
     }
 
-    // 2. Se houver checkout preenchido, resolve o nó do checkout e conecta
     if (checkout_url && checkout_url.trim()) {
       let checkoutNodeId;
       const cleanCheckout = checkout_url.trim();
@@ -2193,7 +3037,6 @@ app.post("/api/funis/salvar-node", async (req, res) => {
         checkoutNodeId = newCheckout[0].id;
       }
 
-      // 3. Cria a conexão (edge) entre a Landing Page e o Checkout se não existir
       const { rows: existingEdge } = await query(
         "SELECT id FROM funnel_edges WHERE from_node_id = $1 AND to_node_id = $2 LIMIT 1",
         [landingNodeId, checkoutNodeId]
@@ -2208,14 +3051,13 @@ app.post("/api/funis/salvar-node", async (req, res) => {
       }
     }
 
-    res.json({ success: true, landingNodeId });
+    res.json({ success: true, landingNodeId, rotulo: rotuloResolvido });
   } catch (err) {
     console.error("[API] Error saving funnel node:", err.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Página de visão geral — mapa de funis de todos os players
 app.get("/funis", async (_req, res) => {
   const { rows: pages } = await query(
     "SELECT slug, nome, url, tipo FROM pages ORDER BY created_at DESC"
@@ -2248,7 +3090,7 @@ app.get("/funis", async (_req, res) => {
   const cardsHtml = comMapa.map(p => `
     <div class="player-card">
       <div class="player-hdr">
-        <span class="player-tipo-badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐" : "📡"}</span>
+        <span class="player-tipo-badge ${p.tipo === "dominio" ? "b-dom" : p.tipo === "keyword" ? "b-key" : "b-pag"}">${p.tipo === "dominio" ? "🌐" : p.tipo === "keyword" ? "🔑" : "📡"}</span>
         <a href="${p.url}" target="_blank" rel="noopener" class="player-nome">${p.nome}</a>
         <a href="/admin/funis/${p.slug}" class="player-edit-link">✏️ Editar</a>
       </div>
@@ -2261,7 +3103,7 @@ app.get("/funis", async (_req, res) => {
     <div class="card" style="margin-top:8px">
       <h2>💤 Sem funil mapeado ainda (${semMapa.length})</h2>
       <div class="sem-mapa-list">
-        ${semMapa.map(p => `<a href="/admin/funis/${p.slug}" class="sem-mapa-item">${p.tipo === "dominio" ? "🌐" : "📡"} ${p.nome}</a>`).join("")}
+        ${semMapa.map(p => `<a href="/admin/funis/${p.slug}" class="sem-mapa-item">${p.tipo === "dominio" ? "🌐" : p.tipo === "keyword" ? "🔑" : "📡"} ${p.nome}</a>`).join("")}
       </div>
     </div>` : "";
 
@@ -2269,7 +3111,7 @@ app.get("/funis", async (_req, res) => {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mapa de Funis — NUTRA MONITOR</title>
+<title>Mapa de Funis — Lowticket Monitor</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2286,7 +3128,6 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 .player-hdr{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .player-tipo-badge{font-size:15px}
 .player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
-.player-nome:hover{color:var(--accent)}
 .player-edit-link{margin-left:auto;font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:4px 10px;border-radius:6px;white-space:nowrap}
 .player-edit-link:hover{background:var(--accent);color:#fff}
 .player-caminhos{display:flex;flex-direction:column;gap:8px}
@@ -2331,16 +3172,12 @@ ${semMapaHtml}
 </body>
 </html>`);
 });
-
 // ─── Dashboard ───────────────────────────────────────────────────────────────
-
-// SVG da logo do Instagram (inline, sem dependência externa)
-const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ig" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs><rect width="24" height="24" rx="6" fill="url(#ig)"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17.5" cy="6.5" r="1.2" fill="white"/></svg>`;
 
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status, last_error FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -2353,7 +3190,25 @@ app.get("/dashboard", async (_req, res) => {
       const primeiraData = {};
       const paginas = {};
       const mon = {};
-      const meta = {}; // instagram_url, geo, nicho, funil por nome
+      const meta = {}; // geo, nicho, funil por nome
+      const slugsDoGrupo = pagesDoGrupo.map((page) => page.slug);
+      const attemptsBySlug = new Map();
+      if (slugsDoGrupo.length > 0) {
+        const { rows: attempts } = await query(`
+          SELECT DISTINCT ON (slug)
+                 slug, status, error,
+                 COALESCE(completed_at, started_at) AS checked_at,
+                 COALESCE(
+                   COALESCE(completed_at, started_at) > NOW() - INTERVAL '6 hours'
+                   AND status LIKE 'falha_%',
+                   FALSE
+                 ) AS alert_relevant
+          FROM scrape_attempts
+          WHERE slug = ANY($1)
+          ORDER BY slug, started_at DESC, id DESC
+        `, [slugsDoGrupo]);
+        for (const attempt of attempts) attemptsBySlug.set(attempt.slug, attempt);
+      }
 
       for (const p of pagesDoGrupo) {
         const { rows: hist } = await query(
@@ -2368,24 +3223,27 @@ app.get("/dashboard", async (_req, res) => {
         );
 
         const latestRow = latest[0];
-        const temDado = hist.length > 0 || !!latestRow;
-        if (!temDado) continue;
+        const latestAttempt = attemptsBySlug.get(p.slug);
 
         ultimaLeitura[p.nome] = {
-          ads:          latestRow ? latestRow.ads_count : hist[hist.length - 1].ads_count,
+          slug:          p.slug,
+          ads:          latestRow ? latestRow.ads_count : (hist.length ? hist[hist.length - 1].ads_count : null),
           url:          p.url,
           ultimaColeta: latestRow
             ? new Date(latestRow.collected_at).toISOString()
-            : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
-          tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
-          status:       p.last_status || null,
-          erro:         p.last_error || null,
+            : null,
+          tentativa:    latestAttempt ? {
+            status: latestAttempt.status,
+            error: latestAttempt.error,
+            at: latestAttempt.checked_at ? new Date(latestAttempt.checked_at).toISOString() : null,
+            relevante: Boolean(latestAttempt.alert_relevant),
+          } : null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
 
         mon[p.nome] = {
-          ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : 0))
+          ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : null))
         };
 
         // Metadados para a dashboard
@@ -2400,19 +3258,20 @@ app.get("/dashboard", async (_req, res) => {
         for (const h of hist) {
           const brDt = toBrDate(h.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
+          const legacySlots = p.tipo === "keyword" ? [6] : p.tipo === "dominio" ? [3, 5, 12, 22] : [3, 12, 22];
           const slot = (h.slot !== null && h.slot !== undefined)
             ? Number(h.slot)
-            : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
+            : legacySlots.reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, legacySlots[0]);
           if (!paginas[p.nome][dk]) paginas[p.nome][dk] = {};
           paginas[p.nome][dk][slot] = h.ads_count;
         }
       }
 
-      const slugs = pagesDoGrupo.map(p => p.slug);
+      const slugs = slugsDoGrupo;
       let histMap = {}, histDates = [];
       if (slugs.length) {
         const { rows: histAll } = await query(`
-          SELECT p.nome, sh.ads_count, sh.slot, sh.collected_at
+          SELECT p.nome, p.tipo, sh.ads_count, sh.slot, sh.collected_at
           FROM scrape_history sh
           JOIN pages p ON p.slug = sh.slug
           WHERE sh.slug = ANY($1) AND sh.collected_at >= NOW() - INTERVAL '60 days'
@@ -2422,9 +3281,10 @@ app.get("/dashboard", async (_req, res) => {
           const nome = r.nome;
           const brDt = toBrDate(r.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
+          const legacySlots = r.tipo === "keyword" ? [6] : r.tipo === "dominio" ? [3, 5, 12, 22] : [3, 12, 22];
           const slot = (r.slot !== null && r.slot !== undefined)
             ? Number(r.slot)
-            : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
+            : legacySlots.reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, legacySlots[0]);
           if (!histMap[nome]) histMap[nome] = {};
           if (!histMap[nome][dk]) histMap[nome][dk] = {};
           if (histMap[nome][dk][slot] === undefined) histMap[nome][dk][slot] = r.ads_count;
@@ -2432,7 +3292,7 @@ app.get("/dashboard", async (_req, res) => {
         histDates = [...new Set(histAll.map(r => toBrDate(r.collected_at).toISOString().slice(0, 10)))]
           .sort((a, b) => b.localeCompare(a));
       }
-      const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
+      const histLibs = Object.keys(histMap).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
 
       return {
         geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon, meta },
@@ -2441,13 +3301,17 @@ app.get("/dashboard", async (_req, res) => {
       };
     }
 
-    const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
+    const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo === "pagina"));
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
+    const grupoKeywords = await processarGrupo(allPages.filter(p => p.tipo === "keyword"));
 
     const dados       = JSON.stringify(grupoPaginas.geral);
     const histDados   = JSON.stringify(grupoPaginas.hist);
     const dadosDom    = JSON.stringify(grupoDominios.geral);
     const histDadosDom = JSON.stringify(grupoDominios.hist);
+    const dadosKey    = JSON.stringify(grupoKeywords.geral);
+    const histDadosKey = JSON.stringify(grupoKeywords.hist);
+    const IG_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor"/></svg>';
 
     // "📢 Mapeamento ADS": lê todo nó tipo='ads', conectado ou não, agrupado por página.
     // Não depende de computarCaminhos() (que exige componente com 2+ nós) — um ADS
@@ -2470,7 +3334,7 @@ app.get("/dashboard", async (_req, res) => {
     const adsCardsHtml = adsPaginas.map(pg => `
       <div class="player-card">
         <div class="player-hdr">
-          <span class="player-tipo-badge ${pg.tipo === "dominio" ? "b-dom" : "b-pag"}">${pg.tipo === "dominio" ? "🌐" : "📡"}</span>
+          <span class="player-tipo-badge ${pg.tipo === "dominio" ? "b-dom" : pg.tipo === "keyword" ? "b-key" : "b-pag"}">${pg.tipo === "dominio" ? "🌐" : pg.tipo === "keyword" ? "🔑" : "📡"}</span>
           <span class="player-nome">${pg.nome}</span>
           <span class="ads-count-badge">📢 ${pg.itens.length} ADS</span>
         </div>
@@ -2480,16 +3344,13 @@ app.get("/dashboard", async (_req, res) => {
       </div>
     `).join("");
 
-    // Serializa o SVG do Instagram para uso seguro dentro do template literal JS
-    const IG_SVG_ESC = IG_SVG.replace(/`/g, "\\`").replace(/\$/g, "\\$");
-
     res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NUTRA MONITOR</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
+<title>Lowticket Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2500,6 +3361,111 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .hdr-live{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text2);background:var(--surface);border:1px solid var(--border);padding:7px 14px;border-radius:8px}
 .hdr-admin-btn{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:6px 14px;border-radius:8px;transition:all .15s;white-space:nowrap}
 .hdr-admin-btn:hover{background:var(--accent);color:#fff}
+.manual-check-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;background:#f5f5f7;color:#17171b;border:0;border-radius:8px;padding:7px 13px;font:600 12px 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,opacity .15s;white-space:nowrap}
+.manual-check-btn:hover{background:#fff}
+.manual-check-btn:disabled{opacity:.6;cursor:wait}
+.manual-check-btn:focus-visible{outline:2px solid #fff;outline-offset:3px}
+.manual-customize-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;background:transparent;color:var(--text2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;font:600 12px 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,border-color .15s,color .15s;white-space:nowrap}
+.manual-customize-btn:hover{background:var(--surface2);border-color:#85859a;color:#fff}
+.manual-customize-btn:disabled{opacity:.55;cursor:wait}
+.manual-customize-btn:focus-visible,.dialog-close:focus-visible,.dialog-primary:focus-visible,.dialog-secondary:focus-visible,.manual-report-open:focus-visible{outline:3px solid #7c6fff;outline-offset:3px}
+.selection-dialog,.confirm-dialog,.report-dialog{width:min(94vw,980px);max-height:calc(100dvh - 36px);padding:0;overflow:hidden;border:1px solid rgba(15,23,42,.12);border-radius:18px;background:#f5f6f7;color:#181b20;box-shadow:0 28px 90px rgba(0,0,0,.38);font-family:'Space Grotesk',sans-serif}
+.selection-dialog::backdrop,.confirm-dialog::backdrop,.report-dialog::backdrop{background:rgba(5,7,12,.68);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.selection-dialog[open],.confirm-dialog[open],.report-dialog[open]{animation:dialog-enter .2s cubic-bezier(.2,.8,.2,1)}
+@keyframes dialog-enter{from{opacity:0;transform:translateY(8px) scale(.99)}to{opacity:1;transform:translateY(0) scale(1)}}
+.selection-dialog-shell,.confirm-dialog-shell,.report-dialog-shell{display:flex;flex-direction:column;max-height:calc(100dvh - 36px)}
+.selection-dialog-head,.report-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:26px 30px 20px;background:#fff;border-bottom:1px solid #e4e6e9}
+.dialog-eyebrow{margin-bottom:8px;color:#69717b;font:600 10px 'Space Mono',monospace;letter-spacing:1.15px}
+.selection-dialog-head h2,.report-head h2{font-size:24px;line-height:1.2;font-weight:650;letter-spacing:0}
+.selection-dialog-head p,.report-head p{margin-top:7px;color:#68717b;font-size:13px;line-height:1.5}
+.dialog-close{display:grid;place-items:center;flex:0 0 34px;width:34px;height:34px;border:0;border-radius:50%;background:#f0f1f2;color:#555e68;font:400 25px/1 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,color .15s}
+.dialog-close:hover{background:#e3e5e8;color:#111}
+.selection-dialog-body{min-height:0;padding:20px 30px;overflow:auto}
+.manual-selection-search-wrap{display:flex;align-items:center;gap:10px;height:42px;margin-bottom:18px;padding:0 13px;border:1px solid #d9dde1;border-radius:10px;background:#fff;color:#7a838d}
+.manual-selection-search{width:100%;height:100%;border:0;outline:0;background:transparent;color:#20252a;font:13px 'Space Grotesk',sans-serif}
+.manual-selection-search-wrap:focus-within{border-color:#397c4b;box-shadow:0 0 0 3px rgba(57,124,75,.16)}
+.manual-selection-search::placeholder{color:#9098a1}
+.selection-groups{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.selection-group{min-width:0;border:1px solid #dfe2e5;border-radius:12px;background:#fff;overflow:hidden}
+.selection-group>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px;border-bottom:1px solid #eceef0}
+.selection-group>header>div{display:flex;align-items:center;gap:10px;min-width:0}
+.selection-group h3{font-size:13px;font-weight:650;letter-spacing:0}
+.selection-group-icon{display:grid;place-items:center;width:27px;height:27px;border-radius:8px;background:#eaf2ec;color:#426d4d;font:700 11px 'Space Mono',monospace}
+.selection-group-icon-url{background:#edf0f4;color:#596775}
+.selection-group-count{color:#737c85;font:11px 'Space Mono',monospace}
+.manual-selection-list{display:flex;flex-direction:column;gap:5px;max-height:310px;min-height:104px;padding:9px;overflow:auto}
+.manual-selection-option{display:flex;align-items:center;gap:11px;min-width:0;padding:10px;border:1px solid transparent;border-radius:8px;background:#f7f8f8;color:#252a30;cursor:pointer;transition:background .14s,border-color .14s}
+.manual-selection-option:hover{background:#f0f3f0}
+.manual-selection-option:has(input:checked){border-color:#b8d0bf;background:#eff6f0}
+.manual-selection-option input{width:17px;height:17px;flex:0 0 17px;margin:0;accent-color:#397c4b}
+.manual-selection-option-copy{display:flex;flex-direction:column;gap:3px;min-width:0}
+.manual-selection-option-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
+.manual-selection-option-url{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#79828b;font:10px 'Space Mono',monospace}
+.selection-empty{display:grid;place-items:center;min-height:86px;padding:14px;color:#89919a;font-size:12px;text-align:center}
+.manual-selection-option[hidden]{display:none}
+.selection-dialog-footer,.report-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 30px;background:#fff;border-top:1px solid #e4e6e9}
+.manual-selection-message,.confirm-note{color:#68717b;font-size:12px}
+.selection-dialog-footer>div,.report-footer>div{display:flex;align-items:center;justify-content:flex-end;gap:9px}
+.dialog-primary,.dialog-secondary{min-height:38px;padding:0 15px;border:1px solid transparent;border-radius:8px;font:600 12px 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,border-color .15s,opacity .15s}
+.dialog-primary{background:#20262c;color:#fff}
+.dialog-primary:hover:not(:disabled){background:#394149}
+.dialog-primary:disabled{opacity:.42;cursor:not-allowed}
+.dialog-secondary{border-color:#d9dde1;background:#fff;color:#515a64}
+.dialog-secondary:hover{background:#f2f3f4;border-color:#c6cbd0}
+.confirm-dialog{width:min(94vw,760px)}
+.confirm-selection-summary{display:flex;align-items:center;gap:10px;padding:14px 30px;color:#333b43;font-size:12px;font-weight:600}
+.confirm-selection-summary span{display:inline-flex;gap:5px;align-items:center;padding:5px 9px;border-radius:6px;background:#e9ecee;color:#505a63;font:11px 'Space Mono',monospace}
+.confirm-selection-list{display:flex;flex-direction:column;gap:6px;max-height:min(48vh,420px);margin:0 30px 18px;padding:2px 4px 2px 0;overflow:auto}
+.confirm-selection-item{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px solid #e1e4e6;border-radius:8px;background:#fff}
+.confirm-selection-item strong{color:#252b31;font-size:12px}
+.confirm-selection-item code{overflow-wrap:anywhere;color:#717b85;font:10px/1.55 'Space Mono',monospace}
+.report-dialog{width:min(94vw,920px)}
+.report-head{align-items:center;padding-bottom:18px}
+.report-head h2{font-size:22px}
+.report-status{display:flex;align-items:center;gap:9px;margin:20px 30px 14px;color:#315f3e;font-size:12px;font-weight:650}
+.report-status:before{content:"";width:8px;height:8px;border-radius:50%;background:#438c55;box-shadow:0 0 0 4px #e2efe4}
+.report-status.has-failures{color:#895f2d}
+.report-status.has-failures:before{background:#c58a36;box-shadow:0 0 0 4px #f6eddd}
+.report-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 30px 22px}
+.report-metric{min-width:0;padding:14px;border:1px solid #e0e3e5;border-radius:10px;background:#fff}
+.report-metric-label{color:#77808a;font-size:10px;font-weight:600;text-transform:uppercase}
+.report-metric-value{margin-top:7px;color:#222930;font:600 23px/1 'Space Mono',monospace}
+.report-results-section{margin:0 30px 20px;border:1px solid #dfe2e5;border-radius:11px;background:#fff;overflow:hidden}
+.report-results-section>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px;border-bottom:1px solid #e8eaec}
+.report-results-section h3{font-size:13px;font-weight:650}
+.report-results-section>header span{color:#79828b;font:10px 'Space Mono',monospace}
+.report-results{display:flex;flex-direction:column;max-height:min(40vh,330px);overflow:auto}
+.report-result-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 15px;border-bottom:1px solid #eef0f1}
+.report-result-row:last-child{border-bottom:0}
+.report-result-copy{display:flex;flex-direction:column;gap:4px;min-width:0}
+.report-result-name{overflow:hidden;color:#2b3137;font-size:12px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}
+.report-result-detail{overflow-wrap:anywhere;color:#77808a;font-size:10px;line-height:1.45}
+.report-result-value{white-space:nowrap;color:#397449;font:600 12px 'Space Mono',monospace}
+.report-result-value.is-failed{color:#a85c4f}
+.report-empty{padding:22px;color:#78818b;font-size:12px;text-align:center}
+.report-footer{font-size:10px;color:#7c858e}
+.manual-report-open{margin-top:12px;padding:0;border:0;background:transparent;color:#c8c7ff;font:600 11px 'Space Grotesk',sans-serif;cursor:pointer}
+.manual-report-open[hidden]{display:none}
+.manual-report-open:hover{text-decoration:underline}
+.manual-run-panel{margin:0 0 20px;padding:14px 16px;background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:12px}
+.manual-run-panel[hidden]{display:none}
+.manual-run-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;font-size:12px}
+.manual-run-dismiss{flex:0 0 auto;width:30px;height:30px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--text2);font-size:20px;line-height:1;cursor:pointer}
+.manual-run-dismiss:hover{border-color:var(--down);color:var(--down)}
+.manual-run-dismiss[hidden]{display:none}
+.manual-run-title{font-weight:600;color:var(--text)}
+.manual-run-summary,.manual-run-current{color:var(--muted);font-size:11px;margin-top:4px}
+.manual-run-count{color:var(--text2);font:11px 'Space Mono',monospace;white-space:nowrap}
+.manual-run-track{height:3px;margin-top:12px;background:var(--surface2);border-radius:3px;overflow:hidden}
+.manual-run-track span{display:block;width:0;height:100%;background:var(--accent);transition:width .25s ease}
+.manual-run-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px 16px;margin-top:12px;max-height:190px;overflow:auto}
+.manual-run-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.045);font-size:11px}
+.manual-run-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)}
+.manual-run-result{white-space:nowrap;color:var(--up);font-family:'Space Mono',monospace}
+.manual-run-result.is-failed{color:var(--down)}
+@media(max-width:760px){.hdr>div:last-child>div:last-child{flex-wrap:wrap;justify-content:flex-end}.selection-dialog-head,.report-head{padding:21px 20px 16px}.selection-dialog-body{padding:16px 20px}.selection-groups{grid-template-columns:1fr}.manual-selection-list{max-height:230px}.selection-dialog-footer,.report-footer{align-items:flex-start;flex-direction:column;padding:14px 20px}.selection-dialog-footer>div,.report-footer>div{width:100%}.selection-dialog-footer .dialog-primary,.report-footer .dialog-primary{flex:1}.confirm-selection-summary{flex-wrap:wrap;padding:12px 20px}.confirm-selection-list{margin:0 20px 16px}.report-status{margin:16px 20px 12px}.report-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 20px 16px}.report-results-section{margin:0 20px 16px}}
+@media(max-width:480px){.selection-dialog,.confirm-dialog,.report-dialog{width:calc(100vw - 20px);max-height:calc(100dvh - 20px);border-radius:14px}.selection-dialog-shell,.confirm-dialog-shell,.report-dialog-shell{max-height:calc(100dvh - 20px)}.selection-dialog-head h2,.report-head h2{font-size:20px}.selection-dialog-head p,.report-head p{font-size:12px}.selection-dialog-footer>div{display:grid;grid-template-columns:1fr 1fr}.confirm-note{font-size:11px}.report-metric{padding:11px}.report-metric-value{font-size:20px}.report-footer>div{display:grid;grid-template-columns:1fr 1fr}.report-result-row{padding:9px 11px}}
+@media(prefers-reduced-motion:reduce){.selection-dialog[open],.confirm-dialog[open],.report-dialog[open]{animation:none}}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 8px var(--up)}
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
@@ -2546,6 +3512,16 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .leg-pct{font-size:11px;color:var(--muted);font-family:'Space Mono',monospace;width:32px;text-align:right}
 .chart-box{height:240px;position:relative}
 .hist-box{height:300px;position:relative}
+.hist-selection{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:24px;margin:-6px 0 10px;color:var(--muted);font-size:11px}
+.hist-selection[hidden]{display:none}
+.hist-reset{border:0;background:transparent;color:var(--accent);font:inherit;cursor:pointer;padding:4px 0;white-space:nowrap}
+.hist-reset:hover{text-decoration:underline}
+.hist-reset:focus-visible,.hist-pin-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hist-pin-cell{min-width:78px}
+.hist-pin-btn{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--muted);font:600 11px 'Space Grotesk',sans-serif;padding:5px 8px;cursor:pointer;white-space:nowrap}
+.hist-pin-btn:hover{border-color:var(--accent);color:var(--text)}
+.hist-pin-btn.is-pinned,.hist-pin-btn.is-focused{border-color:var(--accent);background:rgba(124,111,255,.12);color:var(--accent)}
+.hist-pin-btn:disabled{cursor:not-allowed;opacity:.5}
 .tbl-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{background:var(--surface2);color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:11px 16px;text-align:left;font-weight:600}
@@ -2563,11 +3539,14 @@ tbody tr:hover td{background:var(--surface2)}
 .b-down{background:rgba(251,113,133,.13);color:#fb7185}
 .b-flat{background:rgba(136,136,170,.12);color:#9999b8}
 .b-off{background:rgba(120,120,140,.1);color:#777}
-.scalebar-bg{width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px}
-.scalebar{height:5px;border-radius:3px;display:block}
+.scalebar-bg{width:80px;min-width:80px;max-width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px;overflow:hidden}
+.scalebar{display:block;height:100%;border-radius:3px}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
+.win-btn{background:transparent;color:var(--muted);border:none;border-radius:5px;padding:5px 10px;font-size:11px;font-weight:600;cursor:pointer;font-family:'Space Grotesk'}
+.win-btn.active{background:var(--accent);color:#fff}
+.win-btn:hover{color:var(--text)}
 .ig-cell{text-align:center}
-.ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;transition:background .15s}
+.ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;color:#e879f9;transition:background .15s}
 .ig-link:hover{background:rgba(220,39,67,.15)}
 .ig-none{color:var(--muted);font-size:13px}
 .mono{font-family:'Space Mono',monospace}
@@ -2584,6 +3563,7 @@ tbody tr:hover td{background:var(--surface2)}
 .player-tipo-badge{font-size:15px;padding:2px 6px;border-radius:6px}
 .player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
 .b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-key{background:rgba(251,191,36,.14);color:#fbbf24}
 .b-pag{background:rgba(52,211,153,.12);color:#34d399}
 .chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
 .chip:hover{border-color:var(--accent)}
@@ -2597,6 +3577,7 @@ tbody tr:hover td{background:var(--surface2)}
   .hdr{flex-wrap:wrap;gap:8px}
   .hdr-live{margin-left:0;width:100%}
   .hdr-admin-btn{width:100%;justify-content:center;box-sizing:border-box}
+  .manual-check-btn{width:100%;box-sizing:border-box}
   .hdr h1{font-size:15px}
   .hdr-sub{font-size:10px}
   .scale-card-val{font-size:24px}
@@ -2610,26 +3591,101 @@ tbody tr:hover td{background:var(--surface2)}
   .tbl-panel table tbody td::before{content:attr(data-label);font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:10px;flex-shrink:0}
   .tbl-panel table tbody td.t-name{font-size:14px;font-weight:700;color:#fff;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
   .tbl-panel table tbody td.t-name::before{display:none}
-  .scalebar-bg{width:50px}
+  .scalebar-bg{width:80px;min-width:80px;max-width:80px}
 }
 @media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
+.search-wrap{position:relative;margin-bottom:14px}
+.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none}
+.search-wrap input{width:100%;padding:10px 14px 10px 38px;border-radius:10px;background:var(--surface);border:1px solid var(--border);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;outline:none;transition:.18s;box-sizing:border-box}
+.search-wrap input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,111,255,.15)}
+.search-wrap input::placeholder{color:var(--muted)}
 </style>
 </head>
 <body>
 
 <div class="hdr">
   <div>
-    <h1>📊 NUTRA MONITOR</h1>
+    <h1>📊 Lowticket Monitor</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
     <div class="hdr-live" style="margin-left:0"><span class="dot"></span><span id="livecount"></span></div>
     <div style="display:flex;gap:8px">
+      <button type="button" class="manual-check-btn" id="manual-check-button" title="Conferir todos os itens monitorados">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 1-2.34-5.66L20 7"/></svg>
+        <span id="manual-check-label">Checar todas</span>
+      </button>
+      <button type="button" class="manual-customize-btn" id="manual-customize-button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="m15 17 2 2 4-4"/></svg>
+        Personalizar checagem
+      </button>
       <a href="/admin" class="hdr-admin-btn">⚙️ Ir para Admin</a>
       <a href="/funis" class="hdr-admin-btn">🔀 Ver Mapa de Funis</a>
     </div>
   </div>
 </div>
+
+<section class="manual-run-panel" id="manual-run-panel" hidden>
+  <div class="manual-run-head">
+    <div>
+      <div class="manual-run-title" id="manual-run-title">Checagem manual</div>
+      <div class="manual-run-current" id="manual-run-current" role="status" aria-live="polite"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <div class="manual-run-count" id="manual-run-count"></div>
+      <button type="button" class="manual-run-dismiss" id="manual-run-dismiss" aria-label="Fechar relatório e quadro de checagem" title="Fechar relatório e quadro de checagem" hidden>×</button>
+    </div>
+  </div>
+  <div class="manual-run-track" role="progressbar" aria-label="Progresso da checagem" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="manual-run-progress"></span></div>
+  <div class="manual-run-results" id="manual-run-results"></div>
+  <button type="button" class="manual-report-open" id="manual-report-open" hidden>Ver relatório completo</button>
+</section>
+
+<dialog class="selection-dialog" id="manual-selection-dialog" aria-labelledby="manual-selection-title">
+  <div class="selection-dialog-shell">
+    <header class="selection-dialog-head">
+      <div><div class="dialog-eyebrow">ESCOPO DA COLETA</div><h2 id="manual-selection-title">Personalizar checagem</h2><p>Escolha exatamente o que deseja conferir agora.</p></div>
+      <button type="button" class="dialog-close" id="manual-selection-close" aria-label="Fechar seleção">×</button>
+    </header>
+    <div class="selection-dialog-body">
+      <label class="manual-selection-search-wrap"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input class="manual-selection-search" id="manual-selection-search" type="search" placeholder="Buscar página ou URL monitorada" aria-label="Buscar página ou URL monitorada"></label>
+      <div class="selection-groups">
+        <section class="selection-group" aria-labelledby="manual-pages-title">
+          <header><div><span class="selection-group-icon">P</span><h3 id="manual-pages-title">Páginas Monitoradas</h3></div><span class="selection-group-count" id="manual-pages-count">0</span></header>
+          <div class="manual-selection-list" id="manual-pages-list" role="group" aria-label="Páginas monitoradas"><div class="selection-empty">Carregando páginas...</div></div>
+        </section>
+        <section class="selection-group" aria-labelledby="manual-urls-title">
+          <header><div><span class="selection-group-icon selection-group-icon-url">U</span><h3 id="manual-urls-title">URLs Monitoradas</h3></div><span class="selection-group-count" id="manual-urls-count">0</span></header>
+          <div class="manual-selection-list" id="manual-urls-list" role="group" aria-label="URLs monitoradas"><div class="selection-empty">Carregando URLs...</div></div>
+        </section>
+        <section class="selection-group" aria-labelledby="manual-keywords-title">
+          <header><div><span class="selection-group-icon">K</span><h3 id="manual-keywords-title">Palavras-chave</h3></div><span class="selection-group-count" id="manual-keywords-count">0</span></header>
+          <div class="manual-selection-list" id="manual-keywords-list" role="group" aria-label="Palavras-chave monitoradas"><div class="selection-empty">Carregando palavras-chave...</div></div>
+        </section>
+      </div>
+    </div>
+    <footer class="selection-dialog-footer"><span class="manual-selection-message" id="manual-selection-message">Nenhum item selecionado</span><div><button type="button" class="dialog-secondary" id="manual-selection-cancel">Cancelar</button><button type="button" class="dialog-primary" id="manual-check-selected" disabled>Realizar checagem</button></div></footer>
+  </div>
+</dialog>
+
+<dialog class="confirm-dialog" id="manual-confirm-dialog" aria-labelledby="manual-confirm-title" aria-describedby="manual-confirm-description">
+  <div class="confirm-dialog-shell">
+    <header class="selection-dialog-head"><div><div class="dialog-eyebrow">CONFIRMAÇÃO NECESSÁRIA</div><h2 id="manual-confirm-title">Conferir estes itens?</h2><p id="manual-confirm-description"></p></div><button type="button" class="dialog-close" id="manual-confirm-close" aria-label="Voltar para seleção">×</button></header>
+    <div class="confirm-selection-summary" id="manual-confirm-summary"></div>
+    <div class="confirm-selection-list" id="manual-confirm-list"></div>
+    <footer class="selection-dialog-footer"><span class="confirm-note">A coleta só começa após sua confirmação.</span><div><button type="button" class="dialog-secondary" id="manual-confirm-back">Voltar</button><button type="button" class="dialog-primary" id="manual-confirm-start">Confirmar e iniciar</button></div></footer>
+  </div>
+</dialog>
+
+<dialog class="report-dialog" id="manual-report-dialog" aria-labelledby="manual-report-title" aria-describedby="manual-report-subtitle manual-report-status">
+  <div class="report-dialog-shell">
+    <header class="report-head"><div><div class="dialog-eyebrow">LOWTICKET MONITOR · RESULTADO</div><h2 id="manual-report-title">Relatório da checagem</h2><p id="manual-report-subtitle"></p></div><button type="button" class="dialog-close" id="manual-report-close" aria-label="Fechar relatório e quadro de checagem">×</button></header>
+    <div class="report-status" id="manual-report-status"></div>
+    <div class="report-metrics" id="manual-report-metrics"></div>
+    <section class="report-results-section"><header><h3>Resultado por item monitorado</h3><span id="manual-report-results-count"></span></header><div class="report-results" id="manual-report-results"></div></section>
+    <footer class="report-footer"><span id="manual-report-timestamp"></span><div><button type="button" class="dialog-secondary" id="manual-report-dismiss">Fechar definitivamente</button><button type="button" class="dialog-primary" id="manual-report-refresh">Atualizar dashboard</button></div></footer>
+  </div>
+</dialog>
 
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
 
@@ -2647,19 +3703,41 @@ tbody tr:hover td{background:var(--surface2)}
   </div>
   <div class="panel">
     <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-selection" id="pag_hist-selection" hidden><span id="pag_hist-status" aria-live="polite"></span><button class="hist-reset" id="pag_hist-reset" type="button">Restaurar padrão</button></div>
     <div class="hist-box"><canvas id="pag_cHist"></canvas></div>
   </div>
 </div>
 
 <div class="section-label">📋 Resumo completo</div>
+<div id="pag_window_selector" style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+  <span style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px">Janela:</span>
+  <div style="display:flex;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:3px;gap:3px">
+    <button type="button" data-w="3" class="win-btn active">3D</button>
+    <button type="button" data-w="7" class="win-btn">7D</button>
+    <button type="button" data-w="14" class="win-btn">14D</button>
+    <button type="button" data-w="30" class="win-btn">30D</button>
+    <button type="button" data-w="custom" class="win-btn">Custom</button>
+  </div>
+  <div id="pag_custom_range" style="display:none;align-items:center;gap:6px;margin-left:8px">
+    <input type="date" id="pag_custom_start" style="background:#0f0f1e;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;padding:6px 8px">
+    <span style="color:var(--muted)">até</span>
+    <input type="date" id="pag_custom_end" style="background:#0f0f1e;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;padding:6px 8px">
+    <button type="button" id="pag_custom_apply" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:11px;font-weight:600;cursor:pointer">Aplicar</button>
+  </div>
+</div>
+<div class="search-wrap">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+  <input type="text" id="pag_busca" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarTabela('pag_')">
+</div>
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
+      <th>#</th><th>Bibliotecas</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>Δ Total</th><th>Tendência</th><th id="pag_th_score" tabindex="0" role="button" aria-sort="descending" title="Clique para ordenar pelo score" style="cursor:pointer">SCORE ↕</th><th>Participação</th><th id="pag_th_janela">3D</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
+  <div class="empty-hint" id="pag_busca-vazio" style="display:none;margin:0;border:none;border-top:1px solid var(--border);border-radius:0">Nenhum resultado encontrado.</div>
 </div>
 
 <div style="height:36px"></div>
@@ -2680,24 +3758,68 @@ tbody tr:hover td{background:var(--surface2)}
   </div>
   <div class="panel">
     <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-selection" id="dom_hist-selection" hidden><span id="dom_hist-status" aria-live="polite"></span><button class="hist-reset" id="dom_hist-reset" type="button">Restaurar padrão</button></div>
     <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
   </div>
 </div>
 
 <div class="section-label">📋 Resumo completo</div>
+<div class="search-wrap">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+  <input type="text" id="dom_busca" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarTabela('dom_')">
+</div>
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
+      <th>#</th><th>Domínios</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
   </table>
+  <div class="empty-hint" id="dom_busca-vazio" style="display:none;margin:0;border:none;border-top:1px solid var(--border);border-radius:0">Nenhum resultado encontrado.</div>
 </div>
 
 <div style="height:36px"></div>
 
-<div class="group-title">🔀 Mapeamento de Funis</div>
+  <div class="group-title">🔑 PALAVRAS-CHAVE — rastreio por keyword</div>
+  <div class="section-label">🚀 Escalando agora — palavras-chave em ascensão</div>
+  <div class="scaling-strip" id="key_scaling"></div>
+  <div class="empty-hint" id="key_scaling-empty" style="display:none">Nenhuma palavra-chave em ascensão.</div>
+
+  <div class="grid-charts">
+    <div class="panel">
+      <div class="panel-title">🍩 Distribuição atual</div>
+      <div class="rosca-wrap">
+        <div class="rosca-canvas"><canvas id="key_cRosca"></canvas></div>
+        <div class="legend" id="key_legend"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+      <div class="hist-selection" id="key_hist-selection" hidden><span id="key_hist-status" aria-live="polite"></span><button class="hist-reset" id="key_hist-reset" type="button">Restaurar padrão</button></div>
+      <div class="hist-box"><canvas id="key_cHist"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-label">📋 Resumo completo</div>
+  <div class="search-wrap">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+    <input type="text" id="key_busca" placeholder="Buscar por palavra-chave, URL, geo ou nicho..." oninput="filtrarTabela('key_')">
+  </div>
+  <div class="tbl-panel">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Palavras-chave</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+        <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+      </tr></thead>
+      <tbody id="key_tbody"></tbody>
+    </table>
+    <div class="empty-hint" id="key_busca-vazio" style="display:none;margin:0;border:none;border-top:1px solid var(--border);border-radius:0">Nenhum resultado encontrado.</div>
+  </div>
+
+  <div style="height:36px"></div>
+
+  <div class="group-title">🔀 Mapeamento de Funis</div>
 <div class="empty-hint" style="display:flex;align-items:center;justify-content:center;gap:14px">
   <span>O mapeamento completo de funis agora tem uma página dedicada.</span>
   <a href="/funis" style="font-size:13px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:8px 18px;border-radius:8px;white-space:nowrap">🔀 Abrir Mapa de Funis</a>
@@ -2726,17 +3848,38 @@ ${adsPaginas.length === 0
 
 <div class="accordion-wrap" style="margin-top:12px">
   <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
-    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
+    <span>🌐 Histórico de Coletas — Domínios · 03h · 05h · 12h · 22h</span>
     <span class="acc-meta" id="dom_acc-meta"></span>
     <span class="acc-icon" id="dom_acc-icon">▼</span>
   </button>
   <div class="accordion-body" id="dom_hist-section">Carregando histórico...</div>
 </div>
 
-<script>
-const IG_SVG=\`${IG_SVG_ESC}\`;
+<div class="accordion-wrap" style="margin-top:12px">
+  <button class="accordion-btn" onclick="toggleAccordion('key_hist-section','key_acc-icon')">
+    <span>🔑 Histórico de Coletas — Palavras-chave · 06h</span>
+    <span class="acc-meta" id="key_acc-meta"></span>
+    <span class="acc-icon" id="key_acc-icon">▼</span>
+  </button>
+  <div class="accordion-body" id="key_hist-section">Carregando histórico...</div>
+</div>
 
-document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
+<script>
+const IG_SVG=${JSON.stringify(IG_SVG)};
+document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  páginas 03h · 12h · 22h · domínios 05h · palavras-chave 06h";
+let pagWindow=3;
+let pagCustom=null;
+let pagWindowCustom=false;
+try{
+  const storedWindow=localStorage.getItem("pag_window")||"3";
+  const parsedWindow=parseInt(storedWindow,10);
+  pagWindow=[3,7,14,30].includes(parsedWindow)?parsedWindow:3;
+  pagWindowCustom=storedWindow==="custom";
+  pagCustom=JSON.parse(localStorage.getItem("pag_custom")||"null");
+  if(!pagCustom||typeof pagCustom.start!=="string"||typeof pagCustom.end!=="string")pagCustom=null;
+}catch(error){
+  console.warn("Não foi possível carregar a janela salva das bibliotecas: "+error.message);
+}
 
 function toggleAccordion(bodyId,iconId){
   const body=document.getElementById(bodyId);
@@ -2750,13 +3893,30 @@ const COR=["#7c6fff","#34d399","#fb7185","#fbbf24","#22d3ee","#a78bfa","#f97316"
 function med(s){const v=Object.values(s).filter(x=>!isNaN(x));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null}
 function fd(dk){const[y,m,d]=dk.split("-");return d+"/"+m}
 function fdFull(dk){const[y,m,d]=dk.split("-");return d+"/"+m+"/"+y}
+function escapeAttr(value){return String(value).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]))}
 const{pags,ultima,primeira,mon,meta}=D;
 const LP=Object.keys(pags).sort();
 const dSet=new Set();LP.forEach(p=>Object.keys(pags[p]).forEach(d=>dSet.add(d)));
 const datas=Array.from(dSet).sort();
 
 function serie(pag){return datas.map(dk=>pags[pag]?.[dk]?med(pags[pag][dk]):null)}
-function slope(pag){
+function slope(datas,valores){
+  if(valores.length<2||datas.length!==valores.length)return 0;
+  const rawXs=datas.map((date,index)=>{
+    const timestamp=Date.parse(date+"T00:00:00Z");
+    return Number.isFinite(timestamp)?timestamp/86400000:index;
+  });
+  const baseX=rawXs[0];
+  const xs=rawXs.map(value=>value-baseX);
+  const n=valores.length;
+  const sumX=xs.reduce((sum,value)=>sum+value,0);
+  const sumX2=xs.reduce((sum,value)=>sum+value*value,0);
+  const sumY=valores.reduce((sum,value)=>sum+value,0);
+  const sumXY=xs.reduce((sum,value,index)=>sum+value*valores[index],0);
+  const denominator=n*sumX2-sumX*sumX;
+  return denominator?(n*sumXY-sumX*sumY)/denominator:0;
+}
+function slopeHistorico(pag){
   const s=serie(pag).filter(v=>v!==null);
   if(s.length<2)return 0;
   const recent=s.slice(-3);
@@ -2767,7 +3927,7 @@ function info(pag){
   const ini=mon[pag]?.ini??at;
   const vn=at-ini;
   const pct=ini>0?Math.round(((at-ini)/ini)*100):0;
-  const sl=slope(pag);
+  const sl=slopeHistorico(pag);
   let cls,label,color;
   if(at===0){cls="b-off";label="Inativo";color=getComputedStyle(document.documentElement).getPropertyValue('--muted')}
   else if(pct>50){cls="b-hot";label="Escalando forte";color="#a78bfa"}
@@ -2778,9 +3938,357 @@ function info(pag){
   else{cls="b-down";label="Caindo";color="#fb7185"}
   return{at,ini,vn,pct,sl,cls,label,color};
 }
+function computeWindowStats(pagName,windowDays,customRange){
+  let dateKeys=Object.keys(pags[pagName]||{}).sort();
+  if(customRange){
+    dateKeys=dateKeys.filter(dk=>dk>=customRange.start&&dk<=customRange.end);
+  }else{
+    dateKeys=dateKeys.slice(-windowDays);
+  }
+  const serie=dateKeys.map(dk=>med(pags[pagName][dk])).filter(value=>value!==null);
+  if(serie.length<2)return{pct:0,delta:0,slope:0,label:"Estável",cls:"b-flat",serie,primeiro:serie[0]??0,ultimo:serie[0]??0};
+  const n=serie.length;
+  const firstChunk=serie.slice(0,Math.max(1,Math.floor(n*0.3)));
+  const lastChunk=serie.slice(Math.floor(n*0.7));
+  const primeiro=firstChunk.reduce((sum,value)=>sum+value,0)/firstChunk.length;
+  const ultimo=lastChunk.reduce((sum,value)=>sum+value,0)/lastChunk.length;
+  const delta=ultimo-primeiro;
+  const pct=primeiro>0?(delta/primeiro)*100:0;
+  const sumX=(n*(n-1))/2;
+  const sumX2=(n*(n-1)*(2*n-1))/6;
+  const sumY=serie.reduce((sum,value)=>sum+value,0);
+  const sumXY=serie.reduce((sum,value,index)=>sum+index*value,0);
+  const denominator=n*sumX2-sumX*sumX;
+  const slope=denominator?(n*sumXY-sumX*sumY)/denominator:0;
+  const at=ultima[pagName]?.ads??0;
+  let label="Estável",cls="b-flat";
+  if(at===0){label="Inativo";cls="b-off"}
+  else if(pct>50&&slope>0){label="Escalando forte";cls="b-hot"}
+  else if(pct>15&&slope>0){label="Crescendo";cls="b-up"}
+  else if(delta>0){label="Subindo";cls="b-up"}
+  else if(Math.abs(pct)<=5){label="Estável";cls="b-flat"}
+  else if(delta<0&&pct>-15){label="Caindo";cls="b-down"}
+  else if(pct<-15&&slope<0){label="Cortando";cls="b-down"}
+  return{pct,delta,slope,label,cls,serie,primeiro,ultimo};
+}
+function shiftDateKey(dateKey,days){
+  const date=new Date(dateKey+"T00:00:00Z");
+  date.setUTCDate(date.getUTCDate()+days);
+  return date.toISOString().slice(0,10);
+}
+function computeScoreAndFase(pagName){
+  const at=ultima[pagName]?.ads;
+  if(at===0||at===null||at===undefined)return{score:0,fase:"💀 INATIVO",label:"Morto",velocidadeAtual:0,aceleracao:0};
 
-const porAds=[...LP].sort((a,b)=>(ultima[b]?.ads||0)-(ultima[a]?.ads||0));
-const maxAds=ultima[porAds[0]]?.ads||1;
+  const serieCompleta=datas
+    .map(dk=>({data:dk,valor:pags[pagName]?.[dk]?med(pags[pagName][dk]):null}))
+    .filter(point=>point.valor!==null);
+  const ultimoDia=datas[datas.length-1]||new Date().toISOString().slice(0,10);
+  let inicioAtual,fimAtual,inicioAnterior,fimAnterior;
+  const customStartMs=Date.parse((pagCustom?.start||"")+"T00:00:00Z");
+  const customEndMs=Date.parse((pagCustom?.end||"")+"T00:00:00Z");
+  if(pagWindowCustom&&pagCustom&&Number.isFinite(customStartMs)&&Number.isFinite(customEndMs)&&pagCustom.start<=pagCustom.end){
+    inicioAtual=pagCustom.start;
+    fimAtual=pagCustom.end;
+    const diasJanela=Math.max(1,Math.round((Date.parse(fimAtual+"T00:00:00Z")-Date.parse(inicioAtual+"T00:00:00Z"))/86400000)+1);
+    fimAnterior=shiftDateKey(inicioAtual,-1);
+    inicioAnterior=shiftDateKey(inicioAtual,-diasJanela);
+  }else{
+    const diasJanela=Math.max(1,Number(pagWindow)||3);
+    fimAtual=ultimoDia;
+    inicioAtual=shiftDateKey(fimAtual,-(diasJanela-1));
+    fimAnterior=shiftDateKey(inicioAtual,-1);
+    inicioAnterior=shiftDateKey(inicioAtual,-diasJanela);
+  }
+
+  const atual=serieCompleta.filter(point=>point.data>=inicioAtual&&point.data<=fimAtual);
+  const anterior=serieCompleta.filter(point=>point.data>=inicioAnterior&&point.data<=fimAnterior);
+  const velocidadeAtual=slope(atual.map(point=>point.data),atual.map(point=>point.valor));
+  const velocidadeAnterior=slope(anterior.map(point=>point.data),anterior.map(point=>point.valor));
+  const aceleracao=velocidadeAtual-velocidadeAnterior;
+  const ini=mon[pagName]?.ini||at;
+  const vn=at-ini;
+  let score=0;
+  if(at>=10&&at<=30)score+=35;
+  else if(at<=80)score+=25;
+  else if(at<=150)score+=12;
+  else if(at<=300)score+=3;
+  if(velocidadeAtual>0.5)score+=30;
+  else if(velocidadeAtual>0.1)score+=20;
+  else if(velocidadeAtual>0)score+=8;
+  if(aceleracao>=0&&velocidadeAtual>0)score+=20;
+  else if(aceleracao<0&&velocidadeAtual>0)score+=5;
+  else if(aceleracao>0&&velocidadeAtual<0)score+=8;
+  if(vn>=10&&vn<=150)score+=15;
+  else if(vn>150&&vn<=400)score+=8;
+  score=Math.max(0,Math.min(100,Math.round(score)));
+
+  let fase;
+  if (serieCompleta.length <= 4 && at > 0 && at <= 20) fase = "🧪 TESTANDO";
+  else if (velocidadeAtual > 0.1 && aceleracao >= -0.05) fase = "🚀 ESCALANDO SUBINDO";
+  else if (velocidadeAtual > 0.1 && aceleracao < -0.05) fase = "⚠ ESCALANDO EM DECLÍNIO";
+  else if (Math.abs(velocidadeAtual) <= 0.1) fase = "➖ ESTÁVEL";
+  else if (velocidadeAtual < -0.1 && aceleracao <= 0) fase = "📉 EM QUEDA";
+  else if (velocidadeAtual < -0.1 && aceleracao > 0) fase = "🔄 QUEDA FREANDO";
+  else fase = "➖ ESTÁVEL";
+  return{score,fase,label:fase,velocidadeAtual,aceleracao};
+}
+let scoreSortDirection=-1;
+const scoreByName=new Map();
+if(P==="pag_")LP.forEach(pag=>scoreByName.set(pag,computeScoreAndFase(pag)));
+function windowLabel(){
+  return pagWindowCustom?"CUSTOM":pagWindow+"D";
+}
+function windowTrendHtml(stats){
+  return'<span class="badge '+stats.cls+'">'+stats.label+'</span>';
+}
+function windowValueHtml(stats){
+  if(stats.delta>0)return'<span style="color:#34d399">▲ sub</span> <small style="color:var(--muted)">+'+Math.round(stats.pct)+'%</small>';
+  if(stats.delta<0)return'<span style="color:#fb7185">▼ cai</span> <small style="color:var(--muted)">'+Math.round(stats.pct)+'%</small>';
+  return'<span style="color:var(--muted)">= est</span>';
+}
+function updateResumoBibliotecas(){
+  if(P!=="pag_")return;
+  const header=document.getElementById("pag_th_janela");
+  if(header)header.textContent=windowLabel();
+  document.querySelectorAll("#pag_tbody tr").forEach(function(row){
+    const pagName=row.dataset.pagName;
+    if(!pagName)return;
+    const stats=computeWindowStats(pagName,pagWindow,pagWindowCustom?pagCustom:null);
+    const trendCell=row.querySelector("[data-role='pag-window-trend']");
+    const windowCell=row.querySelector("[data-role='pag-window-value']");
+    if(trendCell)trendCell.innerHTML=windowTrendHtml(stats);
+    if(windowCell){
+      windowCell.innerHTML=windowValueHtml(stats);
+      windowCell.dataset.label=windowLabel();
+    }
+  });
+  updateScoreCellsAndSort();
+  const selector=document.getElementById("pag_window_selector");
+  if(!selector)return;
+  selector.querySelectorAll(".win-btn").forEach(function(button){
+    button.classList.toggle("active",button.dataset.w===(pagWindowCustom?"custom":String(pagWindow)));
+  });
+  const range=document.getElementById("pag_custom_range");
+  if(range)range.style.display=pagWindowCustom?"flex":"none";
+  if(pagCustom){
+    document.getElementById("pag_custom_start").value=pagCustom.start;
+    document.getElementById("pag_custom_end").value=pagCustom.end;
+  }
+}
+function setupResumoBibliotecas(){
+  if(P!=="pag_")return;
+  const selector=document.getElementById("pag_window_selector");
+  if(!selector)return;
+  selector.querySelectorAll(".win-btn").forEach(function(button){
+    button.addEventListener("click",function(){
+      if(button.dataset.w==="custom"){
+        pagWindowCustom=true;
+        try{localStorage.setItem("pag_window","custom")}catch(error){console.warn("Não foi possível salvar a janela das bibliotecas: "+error.message)}
+      }else{
+        pagWindow=parseInt(button.dataset.w,10);
+        pagWindowCustom=false;
+        try{localStorage.setItem("pag_window",String(pagWindow))}catch(error){console.warn("Não foi possível salvar a janela das bibliotecas: "+error.message)}
+      }
+      updateResumoBibliotecas();
+    });
+  });
+  document.getElementById("pag_custom_apply").addEventListener("click",function(){
+    const start=document.getElementById("pag_custom_start").value;
+    const end=document.getElementById("pag_custom_end").value;
+    if(!start||!end||start>end){
+      window.alert("Selecione um intervalo válido: a data inicial deve ser anterior ou igual à data final.");
+      return;
+    }
+    pagCustom={start,end};
+    pagWindowCustom=true;
+    try{
+      localStorage.setItem("pag_custom",JSON.stringify(pagCustom));
+      localStorage.setItem("pag_window","custom");
+    }catch(error){console.warn("Não foi possível salvar o intervalo personalizado das bibliotecas: "+error.message)}
+    updateResumoBibliotecas();
+  });
+  console.log("[DASHBOARD] seletor janela pag_ pronto, Instagram mantido em bibliotecas");
+}
+
+const porAds=[...LP].sort((a,b)=>P==="pag_"
+  ?(scoreByName.get(b)?.score||0)-(scoreByName.get(a)?.score||0)||(ultima[b]?.ads||0)-(ultima[a]?.ads||0)
+  :(ultima[b]?.ads||0)-(ultima[a]?.ads||0));
+function updateScoreCellsAndSort(){
+  if(P!=="pag_")return;
+  const scoreTbody=document.getElementById("pag_tbody");
+  if(!scoreTbody)return;
+  const rows=[...scoreTbody.querySelectorAll("tr")];
+  for(const row of rows){
+    const pagName=row.dataset.pagName;
+    if(!pagName)continue;
+    const result=computeScoreAndFase(pagName);
+    scoreByName.set(pagName,result);
+    const cell=row.querySelector("[data-role='pag-score']");
+    if(cell){
+      const badgeClass=result.score>=85?"b-hot":result.score>=60?"b-up":"b-flat";
+      const title="Velocidade: "+result.velocidadeAtual.toFixed(2)+"/dia | Aceleração: "+result.aceleracao.toFixed(2);
+      cell.innerHTML='<span class="badge '+badgeClass+'" title="'+escapeAttr(title)+'">'+result.score+' '+result.fase+'</span>';
+      cell.dataset.scoreValue=String(result.score);
+    }
+  }
+  rows.sort((a,b)=>{
+    const scoreA=Number(a.querySelector("[data-role='pag-score']")?.dataset.scoreValue)||0;
+    const scoreB=Number(b.querySelector("[data-role='pag-score']")?.dataset.scoreValue)||0;
+    return (scoreA-scoreB)*scoreSortDirection;
+  });
+  rows.forEach((row,index)=>{
+    row.cells[0].textContent=String(index+1);
+    scoreTbody.appendChild(row);
+  });
+}
+const maxAds=Math.max(...LP.map(p=>ultima[p]?.ads||0), 1);
+const MAX_PINNED=4;
+const storageKey="viva_dashboard_pinned_"+P.replace(/_$/g,"");
+const chartSeries=porAds.slice(0,8);
+const pinButtons=new Map();
+let histChart=null;
+let storageUnavailable=false;
+
+function corBiblioteca(nome){
+  let hash=2166136261;
+  for(let i=0;i<nome.length;i++){
+    hash^=nome.charCodeAt(i);
+    hash=Math.imul(hash,16777619);
+  }
+  return COR[(hash>>>0)%COR.length];
+}
+
+function salvarPinned(){
+  try{
+    localStorage.setItem(storageKey,JSON.stringify(pinned));
+    storageUnavailable=false;
+  }catch(e){storageUnavailable=true}
+}
+
+function carregarPinned(){
+  let raw;
+  try{
+    raw=localStorage.getItem(storageKey);
+  }catch(e){storageUnavailable=true;return []}
+  let stored;
+  try{stored=JSON.parse(raw||"[]")}catch(e){
+    try{localStorage.removeItem(storageKey)}catch(error){storageUnavailable=true}
+    return [];
+  }
+  if(!Array.isArray(stored)){
+    try{localStorage.removeItem(storageKey)}catch(e){storageUnavailable=true}
+    return [];
+  }
+  const clean=Array.from(new Set(stored.filter(nome=>typeof nome==="string"&&LP.includes(nome)&&!chartSeries.includes(nome)))).slice(0,MAX_PINNED);
+  if(JSON.stringify(clean)!==JSON.stringify(stored)){
+    try{localStorage.setItem(storageKey,JSON.stringify(clean));}catch(e){storageUnavailable=true}
+  }
+  return clean;
+}
+
+let pinned=carregarPinned();
+let focoHist=pinned[pinned.length-1]||null;
+
+function bibliotecasHistorico(){
+  return Array.from(new Set([...chartSeries,...pinned]));
+}
+
+function atualizarBotoesFixacao(){
+  pinButtons.forEach((button,nome)=>{
+    const isPinned=pinned.includes(nome);
+    const isAutomatic=chartSeries.includes(nome);
+    const isFocused=focoHist===nome;
+    button.textContent="📌 "+(isPinned?"Fixada":isAutomatic?(isFocused?"Em destaque":"Destacar"):"Fixar");
+    button.classList.toggle("is-pinned",isPinned);
+    button.classList.toggle("is-focused",!isPinned&&isFocused);
+    button.disabled=!isPinned&&!isAutomatic&&pinned.length>=MAX_PINNED;
+    button.title=isPinned?"Desafixar do gráfico histórico":isAutomatic?(isFocused?"Remover destaque":"Destacar no gráfico histórico"):button.disabled?"Limite de 4 fixações. Desafixe uma biblioteca primeiro.":"Fixar e destacar no gráfico histórico";
+    button.setAttribute("aria-label",isPinned?"Desafixar "+nome+" do gráfico histórico":isAutomatic?(isFocused?"Remover destaque de "+nome:"Destacar "+nome+" no gráfico histórico"):("Fixar "+nome+" no gráfico histórico"));
+    button.setAttribute("aria-pressed",String(isPinned||isFocused));
+  });
+}
+
+function atualizarSelecaoHistorico(){
+  const selection=document.getElementById(P+"hist-selection");
+  const status=document.getElementById(P+"hist-status");
+  if(selection&&status){
+    selection.hidden=pinned.length===0&&focoHist===null&&!storageUnavailable;
+    const selectionStatus=pinned.length>0?pinned.length+(pinned.length===1?" biblioteca fixada":" bibliotecas fixadas")+" · "+bibliotecasHistorico().length+" séries no gráfico":focoHist?"Destacando: "+focoHist+" · "+bibliotecasHistorico().length+" séries no gráfico":"";
+    status.textContent=selectionStatus+(storageUnavailable?(selectionStatus?" · ":"")+"Não será mantido após recarregar":"");
+  }
+  atualizarBotoesFixacao();
+}
+
+function criarDatasetsHistorico(){
+  return bibliotecasHistorico().map(pag=>{
+    const didK=primeira[pag]||null;
+    const cor=corBiblioteca(pag);
+    const isFocused=focoHist===pag;
+    const isDimmed=focoHist!==null&&!isFocused;
+    return{
+      label:pag,
+      data:serie(pag),
+      borderColor:isDimmed?cor+"66":cor,
+      backgroundColor:"transparent",
+      borderWidth:isFocused?3:isDimmed?1.25:2,
+      pointBackgroundColor:datas.map(dk=>dk===didK?"#fb7185":isDimmed?cor+"66":cor),
+      pointRadius:datas.map(dk=>dk===didK?5:isFocused?3:2),
+      pointHoverRadius:6,
+      tension:.35,
+      spanGaps:true
+    };
+  });
+}
+
+function atualizarGraficoHistorico(){
+  if(!histChart)return;
+  const visibilidade=new Map(histChart.data.datasets.map((dataset,index)=>[dataset.label,histChart.isDatasetVisible(index)]));
+  histChart.data.datasets=criarDatasetsHistorico();
+  histChart.data.datasets.forEach((dataset,index)=>{
+    histChart.setDatasetVisibility(index,visibilidade.has(dataset.label)?visibilidade.get(dataset.label):true);
+  });
+  histChart.update("none");
+}
+
+function rolarParaGraficoHistorico(){
+  const canvas=document.getElementById(P+"cHist");
+  const painel=canvas?.closest(".panel");
+  if(!painel)return;
+  painel.scrollIntoView({
+    behavior:window.matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",
+    block:"center"
+  });
+}
+
+function alternarFixacao(nome){
+  let deveRolar=false;
+  if(pinned.includes(nome)){
+    pinned=pinned.filter(item=>item!==nome);
+    if(focoHist===nome)focoHist=pinned[pinned.length-1]||null;
+  }else if(chartSeries.includes(nome)){
+    deveRolar=focoHist!==nome;
+    focoHist=deveRolar?nome:null;
+  }else{
+    if(pinned.length>=MAX_PINNED)return;
+    pinned=[...pinned,nome];
+    focoHist=nome;
+    deveRolar=true;
+  }
+  salvarPinned();
+  atualizarSelecaoHistorico();
+  atualizarGraficoHistorico();
+  if(deveRolar)rolarParaGraficoHistorico();
+}
+
+const resetHist=document.getElementById(P+"hist-reset");
+if(resetHist)resetHist.addEventListener("click",function(){
+  pinned=[];
+  focoHist=null;
+  salvarPinned();
+  atualizarSelecaoHistorico();
+  atualizarGraficoHistorico();
+});
 
 const escalando=LP.map(p=>({p,...info(p)}))
   .filter(x=>x.at>0&&(x.label==="Escalando forte"||x.label==="Crescendo"||x.label==="Subindo")&&x.pct>0)
@@ -2835,12 +4343,13 @@ if(escalando.length===0){
 const tbody=document.getElementById(P+"tbody");
 porAds.forEach((pag,idx)=>{
   const x=info(pag);
+  const pagWindowStats=P==="pag_"?computeWindowStats(pag,pagWindow,pagWindowCustom?pagCustom:null):null;
   const did=primeira[pag]?fdFull(primeira[pag]):"—";
   const s=serie(pag).filter(v=>v!==null);
   const last3=s.slice(-3);
   const spark3=last3.length>=2?(last3[last3.length-1]>last3[0]?'<span style="color:#34d399">▲ sub</span>':last3[last3.length-1]<last3[0]?'<span style="color:#fb7185">▼ cai</span>':'<span style="color:#888">= est</span>'):"—";
-  const partPct=Math.round((x.at/maxAds)*100);
-  const corLib=COR[idx%COR.length];
+  const partPct=Math.min(100, Math.max(0, Math.round((x.at/maxAds)*100)));
+  const corLib=corBiblioteca(pag);
 
   // Monta célula do nome com badges de geo e nicho
   const m=meta?.[pag]||{};
@@ -2849,30 +4358,73 @@ porAds.forEach((pag,idx)=>{
   const funilBadge=m.funil?'<span class="t-funil-badge">🎯 '+m.funil+'</span>':'';
   const metaBadgesHtml=(geoBadge||nichoBadge||funilBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+funilBadge+'</div>':'';
   const nomeCell='<span class="t-name-main"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></span>'+metaBadgesHtml;
-
-  // Célula do Instagram
-  const igCell=m.instagram_url
-    ?'<a href="'+m.instagram_url+'" target="_blank" rel="noopener" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
-    :'<span class="ig-none">—</span>';
+  const instagramCell=P==="pag_"
+    ?'<td class="ig-cell" data-label="Instagram">'+(m.instagram_url
+      ?'<a href="'+escapeAttr(m.instagram_url)+'" target="_blank" rel="noopener noreferrer" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
+      :'<span class="ig-none">—</span>')+'</td>'
+    :'';
 
   const tr=document.createElement("tr");
+  if(P==="pag_")tr.dataset.pagName=pag;
+  const checkAt=ultima[pag]?.ultimaColeta;
+  tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
+  const trendCell=P==="pag_"
+    ?'<td data-label="Tendência" data-role="pag-window-trend">'+windowTrendHtml(pagWindowStats)+'</td>'
+    :'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>';
+  const scoreData=P==="pag_"?scoreByName.get(pag):null;
+  const scoreBadgeClass=scoreData?(scoreData.score>=85?"b-hot":scoreData.score>=60?"b-up":"b-flat"):"";
+  const scoreTitle=scoreData?"Velocidade: "+scoreData.velocidadeAtual.toFixed(2)+"/dia | Aceleração: "+scoreData.aceleracao.toFixed(2):"";
+  const scoreCell=scoreData
+    ?'<td data-label="SCORE" data-role="pag-score" data-score-value="'+scoreData.score+'"><span class="badge '+scoreBadgeClass+'" title="'+escapeAttr(scoreTitle)+'">'+scoreData.score+' '+scoreData.fase+'</span></td>'
+    :'';
+  const windowCell=P==="pag_"
+    ?'<td class="spark3" data-label="'+windowLabel()+'" data-role="pag-window-value">'+windowValueHtml(pagWindowStats)+'</td>'
+    :'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
   tr.innerHTML=
     '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
     +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
+    +'<td class="hist-pin-cell" data-label="Gráfico"></td>'
     +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
-    +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
-    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
-    +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
-    +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
-    +(ultima[pag]?.status&&ultima[pag].status.indexOf('falha_')===0&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px" title="'+String(ultima[pag].erro||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').slice(0,300)+'">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · '+({falha_timeout:'timeout/rede',falha_bloqueio:'bloqueio da Meta',falha_parse:'contador não lido',falha_url_invalida:'URL inválida',falha_scraping:'falhou'}[ultima[pag].status]||'falhou')+'</div>':'')
+    +'<td class="mono" data-label="Inicial">'+(mon[pag]?.ini==null?'—':x.ini)+'</td>'
+    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+(ultima[pag]?.ads==null?'—':x.at)+'</td>'
+    +'<td class="last-check-cell" data-slug="'+escapeAttr(ultima[pag]?.slug||"")+'" data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
+    +(checkAt?new Date(checkAt).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
-    +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
+    +trendCell
+    +scoreCell
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
-    +'<td class="spark3" data-label="3 dias">'+spark3+'</td>'
-    +'<td class="ig-cell" data-label="Instagram">'+igCell+'</td>';
+    +windowCell
+    +instagramCell;
+  const pinButton=document.createElement("button");
+  pinButton.type="button";
+  pinButton.className="hist-pin-btn";
+  pinButton.addEventListener("click",function(){alternarFixacao(pag)});
+  pinButtons.set(pag,pinButton);
+  tr.querySelector(".hist-pin-cell").appendChild(pinButton);
   tbody.appendChild(tr);
 });
+if(P==="pag_"){
+  const scoreHeader=document.getElementById("pag_th_score");
+  if(scoreHeader){
+    scoreHeader.addEventListener("click",function(){
+      scoreSortDirection*=-1;
+      scoreHeader.setAttribute("aria-sort",scoreSortDirection===-1?"descending":"ascending");
+      updateScoreCellsAndSort();
+    });
+    scoreHeader.addEventListener("keydown",function(event){
+      if(event.key==="Enter"||event.key===" "){
+        event.preventDefault();
+        scoreHeader.click();
+      }
+    });
+  }
+}
+atualizarBotoesFixacao();
+if(P==="pag_"){
+  setupResumoBibliotecas();
+  updateResumoBibliotecas();
+}
 
 const ro=porAds.filter(p=>(ultima[p]?.ads||0)>0);
 const totalRo=ro.reduce((s,p)=>s+(ultima[p]?.ads||0),0);
@@ -2881,7 +4433,7 @@ ro.forEach((p,i)=>{
   const at=ultima[p]?.ads||0;
   const pct=totalRo>0?Math.round((at/totalRo)*100):0;
   const it=document.createElement("div");it.className="leg-item";
-  it.innerHTML='<span class="leg-dot" style="background:'+COR[porAds.indexOf(p)%COR.length]+'"></span>'
+  it.innerHTML='<span class="leg-dot" style="background:'+corBiblioteca(p)+'"></span>'
     +'<span class="leg-name" title="'+p+'">'+p+'</span>'
     +'<span class="leg-val">'+at.toLocaleString("pt-BR")+'</span>'
     +'<span class="leg-pct">'+pct+'%</span>';
@@ -2890,16 +4442,16 @@ ro.forEach((p,i)=>{
 
 new Chart(document.getElementById(P+"cRosca"),{
   type:"doughnut",
-  data:{labels:ro,datasets:[{data:ro.map(p=>ultima[p]?.ads||0),backgroundColor:ro.map(p=>COR[porAds.indexOf(p)%COR.length]),borderWidth:2,borderColor:"#12121f"}]},
+  data:{labels:ro,datasets:[{data:ro.map(p=>ultima[p]?.ads||0),backgroundColor:ro.map(corBiblioteca),borderWidth:2,borderColor:"#12121f"}]},
   options:{responsive:true,maintainAspectRatio:false,cutout:"62%",plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>" "+ctx.label+": "+ctx.parsed.toLocaleString("pt-BR")+" ads"}}}}
 });
 
-const LP_hist=porAds.slice(0,8);
-new Chart(document.getElementById(P+"cHist"),{
+histChart=new Chart(document.getElementById(P+"cHist"),{
   type:"line",
-  data:{labels:datas.map(fd),datasets:LP_hist.map((p)=>{const didK=primeira[p]||null;const c=COR[porAds.indexOf(p)%COR.length];return{label:p,data:serie(p),borderColor:c,backgroundColor:"transparent",borderWidth:2,pointBackgroundColor:datas.map(dk=>dk===didK?"#fb7185":c),pointRadius:datas.map(dk=>dk===didK?5:2),pointHoverRadius:6,tension:.35,spanGaps:true};})},
+  data:{labels:datas.map(fd),datasets:criarDatasetsHistorico()},
   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"bottom",labels:{color:"#b8b8d0",font:{size:11,family:"Space Grotesk"},padding:10,boxWidth:8,usePointStyle:true}},tooltip:{callbacks:{label:ctx=>" "+ctx.dataset.label+": "+(ctx.parsed.y??"—")+" ads"}}},scales:{x:{ticks:{color:"#7a7a98",font:{size:11}},grid:{color:"#1c1c30"}},y:{ticks:{color:"#7a7a98",font:{size:11}},grid:{color:"#1c1c30"},beginAtZero:false}}}
 });
+atualizarSelecaoHistorico();
 
 escalando.forEach((x,i)=>{
   const el=document.getElementById(P+"spark"+i);
@@ -2918,12 +4470,11 @@ if(!HD.dates.length||!HD.libs.length){
     if(v===undefined||v===null)return '<span class="hist-slot empty">—</span>';
     return '<span class="hist-slot">'+v+'</span>';
   }
+  const historySlots=P==="dom_"?[3,5,12,22]:P==="key_"?[6]:[3,12,22];
   let thead='<thead><tr>'
     +'<th style="text-align:left;white-space:nowrap">Biblioteca</th>'
     +'<th style="text-align:left;white-space:nowrap">Data</th>'
-    +'<th style="text-align:center">03h</th>'
-    +'<th style="text-align:center">12h</th>'
-    +'<th style="text-align:center">22h</th>'
+    +historySlots.map(slot=>'<th style="text-align:center">'+String(slot).padStart(2,"0")+'h</th>').join("")
     +'</tr></thead>';
   let tbody2='<tbody>';
   let rowCount=0;
@@ -2932,20 +4483,18 @@ if(!HD.dates.length||!HD.libs.length){
     for(const dk of HD.dates){
       const slots=HD.map[lib]?.[dk];
       if(!slots)continue;
-      const hasAny=slots[3]!==undefined||slots[12]!==undefined||slots[22]!==undefined;
+      const hasAny=historySlots.some(slot=>slots[slot]!==undefined);
       if(!hasAny)continue;
       tbody2+='<tr>'
         +'<td class="lib-name">'+(firstForLib?lib:'')+'</td>'
         +'<td class="date-col">'+fdH(dk)+'</td>'
-        +'<td>'+slotCell(lib,dk,3)+'</td>'
-        +'<td>'+slotCell(lib,dk,12)+'</td>'
-        +'<td>'+slotCell(lib,dk,22)+'</td>'
+        +historySlots.map(slot=>'<td>'+slotCell(lib,dk,slot)+'</td>').join("")
         +'</tr>';
       firstForLib=false;
       rowCount++;
     }
     if(!firstForLib){
-      tbody2+='<tr style="height:4px;background:var(--bg)"><td colspan="5"></td></tr>';
+      tbody2+='<tr style="height:4px;background:var(--bg)"><td colspan="'+(historySlots.length+2)+'"></td></tr>';
     }
   }
   tbody2+='</tbody>';
@@ -2954,25 +4503,654 @@ if(!HD.dates.length||!HD.libs.length){
   if(metaEl)metaEl.textContent='('+rowCount+' registros)';
 }
 }
+function filtrarTabela(P){
+  const termo=document.getElementById(P+"busca").value.trim().toLowerCase();
+  const linhas=document.querySelectorAll("#"+P+"tbody tr");
+  let visiveis=0;
+  linhas.forEach(function(tr){
+    const match=!termo||(tr.dataset.search||"").includes(termo);
+    tr.style.display=match?"":"none";
+    if(match)visiveis++;
+  });
+  const msg=document.getElementById(P+"busca-vazio");
+  if(msg)msg.style.display=visiveis===0?"block":"none";
+}
 
 const D_DOM=__DADOS_DOM__;
 const HD_DOM=__HIST_DOM__;
+const D_KEY=__DADOS_KEY__;
+const HD_KEY=__HIST_KEY__;
 const D_PAG=__DADOS_PLACEHOLDER__;
 const HD_PAG=__HIST_PLACEHOLDER__;
 
-const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length;
-document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
+const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length+Object.keys(D_KEY.pags).length;
+document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_KEY.pags).length+" palavras-chave · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
 
 render(D_PAG,HD_PAG,"pag_");
 render(D_DOM,HD_DOM,"dom_");
+render(D_KEY,HD_KEY,"key_");
 
-<\/script>
+const manualCheckButton=document.getElementById("manual-check-button");
+const manualCheckLabel=document.getElementById("manual-check-label");
+const manualCustomizeButton=document.getElementById("manual-customize-button");
+const manualSelectionDialog=document.getElementById("manual-selection-dialog");
+const manualPagesList=document.getElementById("manual-pages-list");
+const manualUrlsList=document.getElementById("manual-urls-list");
+const manualKeywordsList=document.getElementById("manual-keywords-list");
+const manualSelectionSearch=document.getElementById("manual-selection-search");
+const manualPagesCount=document.getElementById("manual-pages-count");
+const manualUrlsCount=document.getElementById("manual-urls-count");
+const manualKeywordsCount=document.getElementById("manual-keywords-count");
+const manualSelectionMessage=document.getElementById("manual-selection-message");
+const manualCheckSelectedButton=document.getElementById("manual-check-selected");
+const manualConfirmDialog=document.getElementById("manual-confirm-dialog");
+const manualConfirmTitle=document.getElementById("manual-confirm-title");
+const manualConfirmDescription=document.getElementById("manual-confirm-description");
+const manualConfirmSummary=document.getElementById("manual-confirm-summary");
+const manualConfirmList=document.getElementById("manual-confirm-list");
+const manualConfirmStart=document.getElementById("manual-confirm-start");
+const manualRunPanel=document.getElementById("manual-run-panel");
+const manualRunTitle=document.getElementById("manual-run-title");
+const manualRunCurrent=document.getElementById("manual-run-current");
+const manualRunCount=document.getElementById("manual-run-count");
+const manualRunDismiss=document.getElementById("manual-run-dismiss");
+const manualRunProgress=document.getElementById("manual-run-progress");
+const manualRunTrack=manualRunProgress.parentElement;
+const manualRunResults=document.getElementById("manual-run-results");
+const manualReportOpen=document.getElementById("manual-report-open");
+const manualReportDialog=document.getElementById("manual-report-dialog");
+const manualReportSubtitle=document.getElementById("manual-report-subtitle");
+const manualReportStatus=document.getElementById("manual-report-status");
+const manualReportMetrics=document.getElementById("manual-report-metrics");
+const manualReportResultsCount=document.getElementById("manual-report-results-count");
+const manualReportResults=document.getElementById("manual-report-results");
+const manualReportTimestamp=document.getElementById("manual-report-timestamp");
+const MANUAL_REPORT_DISMISSED_KEY="lowticket-manual-check-dismissed-run";
+let dismissedManualRunId=null;
+const manualStatusLabels={
+  ok:"Conferida",
+  ok_zero:"0 anúncios",
+  falha_bloqueio:"Bloqueio Meta",
+  falha_timeout:"Timeout/rede",
+  falha_parse:"Contador não lido",
+  falha_url_invalida:"URL inválida",
+  falha_gravacao:"Falha ao salvar",
+  falha_execucao:"Falha na execução",
+};
+const validManualCheckStates=new Set(["idle","running","completed","completed_with_errors","failed"]);
+const validManualResultStates=new Set(Object.keys(manualStatusLabels));
+const MANUAL_START_RETRY_WINDOW_MS=60_000;
+let dashboardReloadingRunId=null;
+let manualSelectionLoaded=false;
+let manualPages=[];
+let pendingManualSlugs=[];
+let pendingManualSnapshot=[];
+let pendingManualRun=null;
+let manualRequestTrackingId=null;
+let manualDisplayedRunId=null;
+let manualRetryTimer=null;
+const MANUAL_SELECTION_LIMIT=500;
+
+function selectedManualSlugs(){
+  return Array.from(manualSelectionDialog.querySelectorAll("input[type=checkbox]:checked"),function(input){return input.value});
+}
+
+async function fingerprintManualSnapshot(snapshot){
+  const canonical=snapshot
+    .map(page=>[page.slug,page.nome,page.url])
+    .sort((left,right)=>left[0]<right[0]?-1:left[0]>right[0]?1:0);
+  const digest=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(JSON.stringify(canonical)));
+  return Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,"0")).join("");
+}
+
+function updateManualSelectionCount(){
+  const total=selectedManualSlugs().length;
+  for(const checkbox of manualSelectionDialog.querySelectorAll("input[type=checkbox]")){
+    checkbox.disabled=total>=MANUAL_SELECTION_LIMIT&&!checkbox.checked;
+  }
+  manualSelectionMessage.textContent=total>=MANUAL_SELECTION_LIMIT?"Limite de 500 itens por checagem personalizada atingido.":total?total+" item"+(total===1?"":"s")+" selecionado"+(total===1?"":"s"):"Nenhum item selecionado";
+  manualCheckSelectedButton.textContent="Realizar checagem · "+total;
+  manualCheckSelectedButton.disabled=total===0||manualCheckButton.disabled;
+}
+
+function renderManualSelection(pages){
+  manualPages=[...pages].sort((a,b)=>a.nome.localeCompare(b.nome,"pt-BR"));
+  const groups=[
+    {items:manualPages.filter(page=>page.tipo==="pagina"),list:manualPagesList,count:manualPagesCount,empty:"Nenhuma página monitorada cadastrada."},
+    {items:manualPages.filter(page=>page.tipo==="dominio"),list:manualUrlsList,count:manualUrlsCount,empty:"Nenhuma URL monitorada cadastrada."},
+    {items:manualPages.filter(page=>page.tipo==="keyword"),list:manualKeywordsList,count:manualKeywordsCount,empty:"Nenhuma palavra-chave monitorada cadastrada."},
+  ];
+  for(const group of groups){
+    group.list.replaceChildren();
+    group.count.textContent=String(group.items.length);
+    if(!group.items.length){
+      const empty=document.createElement("div");
+      empty.className="selection-empty";
+      empty.textContent=group.empty;
+      group.list.appendChild(empty);
+      continue;
+    }
+    group.items.forEach(function(page){
+      const label=document.createElement("label");
+      label.className="manual-selection-option";
+      label.dataset.search=(page.nome+" "+page.tipo+" "+page.url).toLowerCase();
+      const checkbox=document.createElement("input");
+      checkbox.type="checkbox";
+      checkbox.value=page.slug;
+      checkbox.setAttribute("aria-label","Selecionar "+page.nome);
+      checkbox.addEventListener("change",updateManualSelectionCount);
+      const copy=document.createElement("span");
+      copy.className="manual-selection-option-copy";
+      const name=document.createElement("span");
+      name.className="manual-selection-option-name";
+      name.textContent=page.nome;
+      const url=document.createElement("span");
+      url.className="manual-selection-option-url";
+      url.textContent=page.url;
+      copy.append(name,url);
+      label.append(checkbox,copy);
+      group.list.appendChild(label);
+    });
+  }
+  updateManualSelectionCount();
+}
+
+async function loadManualSelection(force=false){
+  if(manualSelectionLoaded&&!force)return;
+  manualSelectionLoaded=true;
+  try{
+    const response=await fetch("/api/paginas",{cache:"no-store"});
+    if(!response.ok)throw new Error("Não foi possível carregar as bibliotecas.");
+    const pages=await response.json();
+    if(!Array.isArray(pages))throw new Error("A lista de bibliotecas está inválida.");
+    renderManualSelection(pages);
+  }catch(e){
+    manualSelectionLoaded=false;
+    for(const list of [manualPagesList,manualUrlsList,manualKeywordsList]){
+      const error=document.createElement("div");
+      error.className="selection-empty";
+      error.textContent="Falha ao carregar a lista. Feche e abra para tentar novamente.";
+      list.replaceChildren(error);
+    }
+  }
+}
+
+manualCustomizeButton.addEventListener("click",function(){
+  manualSelectionDialog.showModal();
+  manualSelectionSearch.focus();
+  loadManualSelection();
+});
+document.getElementById("manual-selection-close").addEventListener("click",function(){manualSelectionDialog.close()});
+document.getElementById("manual-selection-cancel").addEventListener("click",function(){manualSelectionDialog.close()});
+
+manualSelectionSearch.addEventListener("input",function(){
+  const term=manualSelectionSearch.value.trim().toLowerCase();
+  manualSelectionDialog.querySelectorAll(".manual-selection-option").forEach(function(option){
+    option.hidden=term!==""&&!option.dataset.search.includes(term);
+  });
+});
+
+function openManualConfirmation(slugs,scope){
+  const selected=scope==="todas"?[...manualPages]:slugs.map(slug=>manualPages.find(page=>page.slug===slug)).filter(Boolean);
+  if(!selected.length)return;
+  pendingManualSlugs=scope==="todas"?null:selected.map(page=>page.slug);
+  pendingManualSnapshot=selected.map(page=>({slug:page.slug,nome:page.nome,url:page.url}));
+  const pages=selected.filter(page=>page.tipo==="pagina");
+  const urls=selected.filter(page=>page.tipo==="dominio");
+  const keywords=selected.filter(page=>page.tipo==="keyword");
+  manualConfirmTitle.textContent=scope==="todas"?"Confirmar checagem de todas?":"Confirmar checagem personalizada?";
+  manualConfirmDescription.textContent=scope==="todas"?"Serão checadas todas as "+selected.length+" bibliotecas monitoradas. Revise a lista completa antes de iniciar.":"A checagem vai consultar exatamente estes "+selected.length+" itens. Revise nomes e URLs antes de iniciar.";
+  manualConfirmSummary.replaceChildren();
+  for(const label of [
+    selected.length+" selecionado"+(selected.length===1?"":"s"),
+    pages.length+" página"+(pages.length===1?"":"s"),
+    urls.length+" URL"+(urls.length===1?"":"s"),
+    keywords.length+" palavra-chave"+(keywords.length===1?"":"s"),
+  ]){
+    const badge=document.createElement("span");
+    badge.textContent=label;
+    manualConfirmSummary.appendChild(badge);
+  }
+  manualConfirmList.replaceChildren();
+  for(const page of selected){
+    const row=document.createElement("div");
+    row.className="confirm-selection-item";
+    const name=document.createElement("strong");
+    name.textContent=(page.tipo==="dominio"?"URL monitorada · ":page.tipo==="keyword"?"Palavra-chave monitorada · ":"Página monitorada · ")+page.nome;
+    const url=document.createElement("code");
+    url.textContent=page.url;
+    row.append(name,url);
+    manualConfirmList.appendChild(row);
+  }
+  manualConfirmDialog.showModal();
+}
+
+manualCheckSelectedButton.addEventListener("click",function(){
+  const slugs=selectedManualSlugs();
+  if(!slugs.length)return;
+  openManualConfirmation(slugs,"selecionadas");
+});
+
+async function openAllManualConfirmation(){
+  if(manualCheckButton.disabled)return;
+  manualCheckButton.disabled=true;
+  manualCustomizeButton.disabled=true;
+  manualCheckLabel.textContent="Preparando...";
+  try{
+    await loadManualSelection(true);
+    if(!manualSelectionLoaded)throw new Error("Não foi possível carregar os itens monitorados. Tente novamente.");
+    if(!manualPages.length)throw new Error("Nenhum item monitorado está cadastrado.");
+    openManualConfirmation(null,"todas");
+  }catch(error){
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Não foi possível preparar a checagem";
+    manualRunCurrent.textContent=error.message;
+    manualRunCount.textContent="";
+    manualRunResults.replaceChildren();
+  }finally{
+    manualCheckButton.disabled=false;
+    manualCustomizeButton.disabled=false;
+    manualCheckLabel.textContent="Checar todas";
+    updateManualSelectionCount();
+  }
+}
+
+document.getElementById("manual-confirm-close").addEventListener("click",function(){manualConfirmDialog.close()});
+document.getElementById("manual-confirm-back").addEventListener("click",function(){manualConfirmDialog.close()});
+manualConfirmStart.addEventListener("click",function(){
+  const slugs=pendingManualSlugs===null?null:[...pendingManualSlugs];
+  const snapshot=[...pendingManualSnapshot];
+  if(!snapshot.length)return;
+  pendingManualSlugs=[];
+  pendingManualSnapshot=[];
+  manualConfirmDialog.close();
+  if(manualSelectionDialog.open)manualSelectionDialog.close();
+  startDashboardCheck(slugs,snapshot);
+});
+
+function renderManualReport(state){
+  const resultados=state.resultados||[];
+  const total=Number(state.total)||0;
+  const sucesso=Number(state.sucesso)||0;
+  const falha=Number(state.falha)||0;
+  const inicio=state.iniciadoEm?new Date(state.iniciadoEm):null;
+  const fim=state.finalizadoEm?new Date(state.finalizadoEm):null;
+  const duracao=inicio&&fim?Math.max(0,fim.getTime()-inicio.getTime()):null;
+  const totalSegundos=duracao===null?null:Math.round(duracao/1000);
+  const duracaoLabel=totalSegundos===null?"":totalSegundos<60?totalSegundos+" s":Math.floor(totalSegundos/60)+" min "+(totalSegundos%60)+" s";
+  const escopo=state.escopo==="selecionadas"?"Seleção personalizada":"Todas as monitoradas";
+  const dataFim=fim&&!Number.isNaN(fim.getTime())?fim.toLocaleString("pt-BR",{dateStyle:"long",timeStyle:"short"}):"Horário indisponível";
+  manualReportSubtitle.textContent=escopo+" · "+dataFim;
+  const hasExecutionError=state.status==="completed_with_errors"||state.status==="failed";
+  manualReportStatus.classList.toggle("has-failures",falha>0||hasExecutionError);
+  manualReportStatus.textContent=state.status==="failed"?"Execução interrompida":state.status==="completed_with_errors"?(falha>0?"Checagem concluída com falhas":state.erro||"Checagem concluída com falhas"):falha>0?"Checagem concluída com falhas":"Checagem concluída";
+  manualReportMetrics.replaceChildren();
+  const metricas=[
+    ["No escopo",total],
+    ["Concluídas",Number(state.concluidos)||0],
+    ["Com sucesso",sucesso],
+    ["Com falha",falha],
+  ];
+  for(const [label,value] of metricas){
+    const metric=document.createElement("div");
+    metric.className="report-metric";
+    const metricLabel=document.createElement("div");
+    metricLabel.className="report-metric-label";
+    metricLabel.textContent=label;
+    const metricValue=document.createElement("div");
+    metricValue.className="report-metric-value";
+    metricValue.textContent=Number(value).toLocaleString("pt-BR");
+    metric.append(metricLabel,metricValue);
+    manualReportMetrics.appendChild(metric);
+  }
+  manualReportResultsCount.textContent=resultados.length+" de "+total+" itens";
+  manualReportResults.replaceChildren();
+  if(!resultados.length){
+    const empty=document.createElement("div");
+    empty.className="report-empty";
+    empty.textContent=state.erro||"Nenhum resultado foi registrado nesta execução.";
+    manualReportResults.appendChild(empty);
+  }
+  for(const item of resultados){
+    const row=document.createElement("div");
+    row.className="report-result-row";
+    const copy=document.createElement("div");
+    copy.className="report-result-copy";
+    const name=document.createElement("span");
+    name.className="report-result-name";
+    name.textContent=item.nome||item.slug||"Biblioteca sem nome";
+    const detail=document.createElement("span");
+    detail.className="report-result-detail";
+    const ok=item.count!==null&&item.count!==undefined;
+    detail.textContent=ok?"Coleta concluída com sucesso":(item.falha||manualStatusLabels[item.status]||"Não foi possível concluir a coleta.");
+    const value=document.createElement("span");
+    value.className="report-result-value";
+    value.textContent=ok?Number(item.count).toLocaleString("pt-BR")+" anúncios":(manualStatusLabels[item.status]||"Falhou");
+    if(!ok)value.classList.add("is-failed");
+    copy.append(name,detail);
+    row.append(copy,value);
+    manualReportResults.appendChild(row);
+  }
+  manualReportTimestamp.textContent="Início: "+(inicio&&!Number.isNaN(inicio.getTime())?inicio.toLocaleString("pt-BR"):"indisponível")+(duracaoLabel?" · Duração: "+duracaoLabel:"");
+}
+
+manualReportOpen.addEventListener("click",function(){
+  if(!manualReportDialog.open)manualReportDialog.showModal();
+});
+function dismissManualReport(runId){
+  if(runId){
+    dismissedManualRunId=runId;
+    try{
+      localStorage.setItem(MANUAL_REPORT_DISMISSED_KEY,runId);
+    }catch(error){
+      console.warn("Não foi possível salvar a dispensa do relatório neste navegador: "+error.message);
+    }
+  }
+  manualReportDialog.close();
+  manualRunPanel.hidden=true;
+  manualReportOpen.hidden=true;
+}
+manualRunDismiss.addEventListener("click",function(){dismissManualReport(manualDisplayedRunId||manualRequestTrackingId)});
+document.getElementById("manual-report-close").addEventListener("click",function(){dismissManualReport(manualDisplayedRunId||manualRequestTrackingId)});
+document.getElementById("manual-report-dismiss").addEventListener("click",function(){dismissManualReport(manualDisplayedRunId||manualRequestTrackingId)});
+manualReportDialog.addEventListener("cancel",function(event){
+  event.preventDefault();
+  dismissManualReport(manualDisplayedRunId||manualRequestTrackingId);
+});
+document.getElementById("manual-report-refresh").addEventListener("click",function(){
+  manualReportDialog.close();
+  window.location.reload();
+});
+
+function renderManualCheck(state){
+  const estaRodando=state.status==="running";
+  const finalizado=state.status==="completed"||state.status==="completed_with_errors"||state.status==="failed";
+  const ocupadoSemRelatorio=state.ocupado&&!estaRodando&&!finalizado;
+  if(state.runId)manualDisplayedRunId=state.runId;
+  manualCheckButton.disabled=estaRodando||state.ocupado;
+  manualCustomizeButton.disabled=estaRodando||state.ocupado;
+  manualCheckLabel.textContent=estaRodando?"Conferindo...":"Checar todas";
+  updateManualSelectionCount();
+  if(state.status==="idle"&&!state.ocupado){
+    manualRunPanel.hidden=true;
+    manualReportOpen.hidden=true;
+    manualRunDismiss.hidden=true;
+    return;
+  }
+  if(finalizado&&state.runId){
+    let dismissedRunId=dismissedManualRunId;
+    try{
+      dismissedRunId=localStorage.getItem(MANUAL_REPORT_DISMISSED_KEY)||dismissedRunId;
+    }catch(error){
+      console.warn("Não foi possível consultar a dispensa salva do relatório: "+error.message);
+    }
+    if(dismissedRunId===state.runId){
+      manualRunPanel.hidden=true;
+      manualReportOpen.hidden=true;
+      manualRunDismiss.hidden=true;
+      if(manualReportDialog.open)manualReportDialog.close();
+      return;
+    }
+  }
+  manualRunPanel.hidden=false;
+  if(ocupadoSemRelatorio){
+    manualRunTitle.textContent="Já existe uma coleta em andamento";
+    manualRunCurrent.textContent="Aguarde a execução atual terminar para iniciar outra.";
+    manualRunCount.textContent="";
+    manualRunProgress.style.width="0%";
+    manualRunTrack.setAttribute("aria-valuenow","0");
+    manualRunResults.replaceChildren();
+    return;
+  }
+
+  const progresso=state.total?Math.round((state.concluidos/state.total)*100):0;
+  manualRunTitle.textContent=state.status==="running"?(state.escopo==="selecionadas"?"Conferindo selecionadas":"Conferindo itens monitorados"):state.status==="completed"?"Checagem concluída":state.status==="failed"?"Não foi possível concluir a checagem":"Checagem concluída com falhas";
+  manualRunCurrent.textContent=state.status==="running"?(state.atual?"Conferindo: "+state.atual:"Preparando coleta..."):(state.erro||"Resultado atualizado na dashboard.");
+  manualRunCount.textContent=state.concluidos+" / "+state.total+" · "+state.sucesso+" ok · "+state.falha+" falhas";
+  manualRunProgress.style.width=progresso+"%";
+  manualRunTrack.setAttribute("aria-valuenow",String(progresso));
+  manualRunResults.replaceChildren();
+  manualReportOpen.hidden=!finalizado;
+  manualRunDismiss.hidden=!finalizado;
+  for(const item of state.resultados||[]){
+    const row=document.createElement("div");
+    row.className="manual-run-row";
+    row.title=item.falha||"";
+    const name=document.createElement("span");
+    name.className="manual-run-name";
+    name.textContent=item.nome||item.slug;
+    const result=document.createElement("span");
+    result.className="manual-run-result";
+    const ok=item.count!==null&&item.count!==undefined;
+    result.textContent=ok?Number(item.count).toLocaleString("pt-BR")+" anúncios":(manualStatusLabels[item.status]||"Falhou");
+    if(!ok)result.classList.add("is-failed");
+    row.append(name,result);
+    manualRunResults.appendChild(row);
+  }
+
+  if(finalizado){
+    renderManualReport(state);
+    refreshLastChecks();
+    try{
+      const reportKey="lowticket-manual-check-report-seen";
+      if(state.runId&&sessionStorage.getItem(reportKey)!==state.runId){
+        sessionStorage.setItem(reportKey,state.runId);
+        if(!manualReportDialog.open)manualReportDialog.showModal();
+      }
+    }catch(e){if(!manualReportDialog.open)manualReportDialog.showModal()}
+  }
+}
+
+async function refreshLastChecks(){
+  try{
+    const response=await fetch("/api/ultima-checagem",{cache:"no-store"});
+    if(!response.ok)throw new Error("Falha ao consultar últimas checagens");
+    const checks=await response.json();
+    const cells=new Map([...document.querySelectorAll(".last-check-cell")].map(cell=>[cell.dataset.slug,cell]));
+    const labels={falha_timeout:"timeout",falha_bloqueio:"bloqueio Meta",falha_parse:"não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar"};
+    for(const check of checks){
+      const cell=cells.get(check.slug);
+      if(!cell)continue;
+      cell.replaceChildren();
+      if(check.ultima_coleta_ok){
+        cell.append(document.createTextNode(new Date(check.ultima_coleta_ok).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})));
+      }else{
+        cell.append(document.createTextNode("—"));
+      }
+      if(check.tentativa?.relevante&&labels[check.tentativa?.status]){
+        const state=document.createElement("div");
+        state.style.color="#fb7185";
+        state.style.fontSize="10px";
+        state.textContent=labels[check.tentativa.status];
+        if(check.tentativa.error)state.title=check.tentativa.error;
+        cell.appendChild(state);
+      }
+    }
+  }catch(err){
+    console.warn("[DASHBOARD] não foi possível atualizar últimas checagens: "+err.message);
+  }
+}
+
+async function updateManualCheck(){
+  try{
+    const statusUrl=manualRequestTrackingId?"/api/coletar-tudo/status?requestId="+encodeURIComponent(manualRequestTrackingId):"/api/coletar-tudo/status";
+    const response=await fetch(statusUrl,{cache:"no-store"});
+    if(!response.ok)throw new Error("Falha ao consultar status");
+    const state=await response.json();
+    if(!state||!validManualCheckStates.has(state.status)||typeof state.ocupado!=="boolean"||!Array.isArray(state.resultados)
+      ||![state.total,state.concluidos,state.sucesso,state.falha].every(Number.isFinite)
+      ||state.resultados.some(item=>!item||typeof item!=="object"||typeof item.slug!=="string"||typeof item.nome!=="string"||!validManualResultStates.has(item.status)
+        ||(item.count===null?item.status==="ok"||item.status==="ok_zero":!Number.isFinite(item.count)||item.status!=="ok"&&item.status!=="ok_zero")))throw new Error("Resposta de status inválida");
+    if(pendingManualRun){
+      if(state.requestId===pendingManualRun.requestId){
+        manualRequestTrackingId=pendingManualRun.requestId;
+        pendingManualRun=null;
+      }else if(state.ocupado){
+        renderManualCheck({status:"idle",ocupado:true,resultados:[]});
+        setTimeout(updateManualCheck,1500);
+        return;
+      }else if(!state.ocupado){
+        showManualStartPending();
+        schedulePendingManualRetry();
+        return;
+      }
+    }
+    renderManualCheck(state);
+    if(state.status==="running"||state.ocupado)setTimeout(updateManualCheck,1500);
+  }catch(e){
+    manualCheckButton.disabled=true;
+    manualCustomizeButton.disabled=true;
+    manualCheckSelectedButton.disabled=true;
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Não foi possível consultar a checagem";
+    manualRunCurrent.textContent="Atualize a página para tentar novamente.";
+    setTimeout(updateManualCheck,3000);
+  }
+}
+
+function schedulePendingManualRetry(){
+  if(!pendingManualRun)return;
+  if(Date.now()-pendingManualRun.startedAt>=MANUAL_START_RETRY_WINDOW_MS){
+    if(manualRetryTimer!==null){
+      clearTimeout(manualRetryTimer);
+      manualRetryTimer=null;
+    }
+    manualRunCurrent.textContent="Ainda não foi possível confirmar a execução. A tela continuará consultando o status; não inicie outra checagem.";
+    setTimeout(updateManualCheck,3000);
+    return;
+  }
+  if(manualRetryTimer!==null)return;
+  const remaining=MANUAL_START_RETRY_WINDOW_MS-(Date.now()-pendingManualRun.startedAt);
+  manualRetryTimer=setTimeout(function(){
+    manualRetryTimer=null;
+    if(!pendingManualRun)return;
+    if(Date.now()-pendingManualRun.startedAt>=MANUAL_START_RETRY_WINDOW_MS){
+      schedulePendingManualRetry();
+      return;
+    }
+    startDashboardCheck(pendingManualRun.slugs,pendingManualRun.snapshot,pendingManualRun.requestId);
+  },Math.min(1800,remaining));
+}
+
+function showManualStartPending(){
+  manualRunPanel.hidden=false;
+  manualRunTitle.textContent="Confirmando o início da checagem";
+  manualRunCurrent.textContent="A resposta do servidor não foi conclusiva. Consultando o status antes de permitir outra tentativa.";
+  manualRunCount.textContent="";
+  manualRunResults.replaceChildren();
+}
+
+async function startDashboardCheck(slugs,snapshot,requestId=crypto.randomUUID()){
+  if(manualRetryTimer!==null){
+    clearTimeout(manualRetryTimer);
+    manualRetryTimer=null;
+  }
+  if(!pendingManualRun||pendingManualRun.requestId!==requestId){
+    manualRequestTrackingId=null;
+    pendingManualRun={slugs:slugs?[...slugs]:null,snapshot:snapshot.map(item=>({...item})),requestId:requestId,startedAt:Date.now()};
+  }
+  manualCheckButton.disabled=true;
+  manualCustomizeButton.disabled=true;
+  manualCheckSelectedButton.disabled=true;
+  manualCheckLabel.textContent="Iniciando...";
+  let requestMayHaveStarted=false;
+  try{
+    if(!Array.isArray(snapshot)||!snapshot.length)throw new Error("A lista confirmada está vazia. Reabra a confirmação e tente novamente.");
+    const payload={...(slugs?{slugs:slugs}:{}),requestId:requestId,snapshotHash:await fingerprintManualSnapshot(snapshot),snapshotCount:snapshot.length};
+    const options={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)};
+    requestMayHaveStarted=true;
+    const response=await fetch("/api/coletar-tudo",options);
+    let data;
+    try{
+      data=await response.json();
+    }catch{
+      if(response.status>=400&&response.status<500&&response.status!==408){
+        requestMayHaveStarted=false;
+        throw new Error("O servidor recusou a solicitação ("+response.status+"). A checagem não foi iniciada.");
+      }
+      throw new Error("O servidor retornou uma resposta inconclusiva.");
+    }
+    if(response.status===409){
+      if(data.status==="selection_changed"){
+        pendingManualRun=null;
+        manualRequestTrackingId=null;
+        manualCheckButton.disabled=false;
+        manualCustomizeButton.disabled=false;
+        manualCheckLabel.textContent="Checar todas";
+        manualSelectionLoaded=false;
+        manualPages=[];
+        manualRunPanel.hidden=false;
+        manualRunTitle.textContent="A seleção precisa ser revisada";
+        manualRunCurrent.textContent=data.message||"Os dados mudaram. Abra a personalização e confirme novamente.";
+        manualRunCount.textContent="";
+        manualRunResults.replaceChildren();
+        return;
+      }
+      if(data.status==="request_conflict"){
+        pendingManualRun=null;
+        manualRequestTrackingId=null;
+        manualCheckButton.disabled=false;
+        manualCustomizeButton.disabled=false;
+        manualCheckLabel.textContent="Checar todas";
+        manualRunPanel.hidden=false;
+        manualRunTitle.textContent="Não foi possível confirmar esta execução";
+        manualRunCurrent.textContent=data.message||"Reabra a confirmação e tente novamente.";
+        return;
+      }
+      renderManualCheck({status:"idle",ocupado:true,resultados:[]});
+      setTimeout(updateManualCheck,1800);
+      return;
+    }
+    if(!response.ok){
+      requestMayHaveStarted=response.status>=500||response.status===408;
+      if(response.status===500&&data.status==="error")requestMayHaveStarted=false;
+      if(!requestMayHaveStarted){pendingManualRun=null;manualRequestTrackingId=null;}
+      throw new Error(data.message||"Não foi possível iniciar a checagem.");
+    }
+    if(data.status!=="started"||typeof data.runId!=="string"){
+      showManualStartPending();
+      schedulePendingManualRetry();
+      return;
+    }
+    manualRequestTrackingId=requestId;
+    pendingManualRun=null;
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Iniciando checagem";
+    manualRunCurrent.textContent=slugs?"Preparando os itens selecionados...":"Preparando os itens monitorados...";
+    setTimeout(updateManualCheck,500);
+  }catch(e){
+    if(requestMayHaveStarted){
+      showManualStartPending();
+      schedulePendingManualRetry();
+      return;
+    }
+    pendingManualRun=null;
+    manualRequestTrackingId=null;
+    manualCheckButton.disabled=false;
+    manualCustomizeButton.disabled=false;
+    manualCheckLabel.textContent="Checar todas";
+    updateManualSelectionCount();
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Não foi possível iniciar a checagem";
+    manualRunCurrent.textContent=e.message;
+  }
+}
+
+manualCheckButton.addEventListener("click",openAllManualConfirmation);
+
+updateManualCheck();
+refreshLastChecks();
+setInterval(refreshLastChecks,30000);
+
+</script>
 </body>
 </html>`
-      .replace("__DADOS_DOM__", dadosDom)
-      .replace("__HIST_DOM__", histDadosDom)
-      .replace("__DADOS_PLACEHOLDER__", dados)
-      .replace("__HIST_PLACEHOLDER__", histDados));
+      .replace("__DADOS_DOM__", () => dadosDom)
+      .replace("__HIST_DOM__", () => histDadosDom)
+      .replace("__DADOS_KEY__", () => dadosKey)
+      .replace("__HIST_KEY__", () => histDadosKey)
+      .replace("__DADOS_PLACEHOLDER__", () => dados)
+      .replace("__HIST_PLACEHOLDER__", () => histDados));
   } catch (err) {
     res.status(500).send("Erro: " + err.message);
   }
@@ -2980,7 +5158,6 @@ render(D_DOM,HD_DOM,"dom_");
 
 // ─── Scheduler ───────────────────────────────────────────────────────────────
 
-// O agendamento agora é feito externamente via rota GET /api/cron/tick (ex: UptimeRobot a cada 5 min)
 console.log("[CRON] Usando arquitetura de Fila Assíncrona via /api/cron/tick");
 
 // ─── Start ────────────────────────────────────────────────────────────────────
