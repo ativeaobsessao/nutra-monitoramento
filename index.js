@@ -1855,7 +1855,7 @@ app.get("/admin", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lowticket Monitor — Admin</title>
+<title>Nutra Monitor — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1939,7 +1939,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
   </div>
 </div>
 <div class="hdr">
-  <h1>⚙️ Admin — Lowticket Monitor</h1>
+  <h1>⚙️ Admin — Nutra Monitor</h1>
   <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
     <a href="/dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">← Ver Dashboard</a>
     <a href="/funis" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">🔀 Ver Mapa de Funis</a>
@@ -3111,7 +3111,7 @@ app.get("/funis", async (_req, res) => {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mapa de Funis — Lowticket Monitor</title>
+<title>Mapa de Funis — Nutra Monitor</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -3349,7 +3349,7 @@ app.get("/dashboard", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lowticket Monitor</title>
+<title>Nutra Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
@@ -3605,7 +3605,7 @@ tbody tr:hover td{background:var(--surface2)}
 
 <div class="hdr">
   <div>
-    <h1>📊 Lowticket Monitor</h1>
+    <h1>📊 Nutra Monitor</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
@@ -3679,7 +3679,7 @@ tbody tr:hover td{background:var(--surface2)}
 
 <dialog class="report-dialog" id="manual-report-dialog" aria-labelledby="manual-report-title" aria-describedby="manual-report-subtitle manual-report-status">
   <div class="report-dialog-shell">
-    <header class="report-head"><div><div class="dialog-eyebrow">LOWTICKET MONITOR · RESULTADO</div><h2 id="manual-report-title">Relatório da checagem</h2><p id="manual-report-subtitle"></p></div><button type="button" class="dialog-close" id="manual-report-close" aria-label="Fechar relatório e quadro de checagem">×</button></header>
+    <header class="report-head"><div><div class="dialog-eyebrow">Nutra Monitor · RESULTADO</div><h2 id="manual-report-title">Relatório da checagem</h2><p id="manual-report-subtitle"></p></div><button type="button" class="dialog-close" id="manual-report-close" aria-label="Fechar relatório e quadro de checagem">×</button></header>
     <div class="report-status" id="manual-report-status"></div>
     <div class="report-metrics" id="manual-report-metrics"></div>
     <section class="report-results-section"><header><h3>Resultado por item monitorado</h3><span id="manual-report-results-count"></span></header><div class="report-results" id="manual-report-results"></div></section>
