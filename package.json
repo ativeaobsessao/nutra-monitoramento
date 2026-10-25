@@ -1,15 +1,15 @@
 {
-  "name": "nutra-monitoramento",
+  "name": "viva-labs",
   "version": "2.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node --expose-gc index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "node-cron": "^3.0.3",
     "pg": "^8.11.5",
     "playwright": "^1.44.0"
   }
